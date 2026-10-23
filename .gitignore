@@ -1,0 +1,34 @@
+# Site configuration and credentials
+**/config.json
+**/config.*.json
+!**/config.example.json
+.env
+.env.*
+*.pem
+*.key
+**/配置备份/
+**/部署记录/
+**/运行记录/
+**/clock_sync/
+**/browser_profile/
+**/deliveries/
+**/手工复测/
+**/jobs/
+# Dependencies and generated artifacts
+**/runtime/
+**/wheelhouse/
+**/drivers/
+**/prerequisites/
+**/.venv/
+**/node_modules/
+**/__pycache__/
+*.pyc
+*.log
+*.partial
+*.tmp
+*.zip
+output/
+outputs/
+tmp/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,25 @@
+{
+  "version": "0.4.12 在线视频优先版",
+  "files": {
+    "company_template.py": "a7a4800709ac3a1607f912669a30830c8f8fc6c395fc38f8327d94146054cb1a",
+    "environment_setup.py": "0876835292e14ec6c62d49c2e480f918b72100cbf22fa227eca3de5d965ebfcc",
+    "hardware_support.py": "393a042af471e7e2bb88e814f6d92e5604de58a9df3b45b5795e8aae0c5dbef8",
+    "media_session.py": "caea603b9f3d50c48b48cae4f4100efeb609d6d73099ae700dd36ef789c3b6c1",
+    "resume_flow.py": "2ef9aac7a83b375c633690f383039cda7eea68fc8bb8ff47efad9fdc93caef77",
+    "runtime_check.py": "b15d0ebce8eb490951ff9c93beeab692de0928de082ee9e5c1054999de54842d",
+    "serial_link.py": "595a6bc065ca6476e76b3ace38214a6660063286759aa7b31af7cbe4f28f4fd5",
+    "temperature_report.py": "e6b94d9d4ee97c4f0f2a2300177f1df2492ab61d34c0b32d07dc6ee8baf55ed5",
+    "windows_temperature_test.py": "d62ec30f0561dda713e3124c52becb3dcc2e9b8ad0b1b54b50656c9263dac558",
+    "启动校验.py": "2298a5c82223ec615b3917feacd076867538eae12882c73e5199ac8748aa9327",
+    "接入并验证BIT.py": "f78001dea81768dfbaae609f29e94fa349ee11e8e982752232c8c56246a3dcf9",
+    "继续软件适配.py": "f18159a32e61f6798a8fa914d5df1d40462d88311694275fdecee4169357226f",
+    "补采软件窗口.py": "4c8ffa012a5bfe9bb3d5758a0c8c1f1ba188fba3e8d63afdacde3f7b45d52113",
+    "集中联调.py": "58d7cd4d3373bd8377a6c9bfb8dc82d3c2b7b2717177f178440887e588bf561d",
+    "验证HWiNFO自动记录.py": "d9340244186433c78069d641818447f2dd7a81c128435eed62874b4d0fb411ef",
+    "统一启动.cmd": "df22a8dd9c63c3811d6db06808b297a9d291bbcac6db572a0ee27a256d342b11",
+    "开始_测试主机.cmd": "3ffeb393a9e0ff68a0b4cb5e1a7b0bfcae79f37551f0b3b6d8b7cbf8a053188c",
+    "开始_接收电脑.cmd": "78767282ab74f42fd577bb43035c5d6e38a278c199569e722c59b229c560eefc",
+    "repair_runtime.ps1": "814b19aea628b83dc8d6948117c84f29b51693426c80c9d6235758eebc468661",
+    "配置环境.cmd": "2cd87ae4b9541648ad6b594d5aa5f3c6ece5949732ebaca30ceb5c02ee9ea9eb"
+  }
+}

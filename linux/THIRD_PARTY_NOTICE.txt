@@ -1,0 +1,11 @@
+This package includes third-party Python wheel distributions for offline installation.
+Each wheel retains its own distribution metadata, license, and copyright notices.
+See the respective *.dist-info/licenses, LICENSE, or METADATA entries inside each wheel.
+requirements.lock records exact versions and SHA-256 checksums.
+
+The supplied company workbook template and the company-specific plot conventions retain
+their original ownership. The test implementation is readable in linux_temperature_test.py;
+it does not load or install a private test-framework package. Original input archives were
+not modified. SSH login passwords may be saved in the local config.json as requested by the operator. Never commit the populated file or its backups.
+
+No vendor USB driver, vendor application, Python installer, or Linux executable is bundled.

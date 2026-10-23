@@ -1,0 +1,175 @@
+{
+  "_说明": "首次启动自动生成 config.json；先填写可访问的 NTP、本地视频路径和在线视频网址。盘信息与网卡自动识别。更新保留现场 config.json。",
+  "station": "WIN-SSD-01",
+  "serial": {
+    "receiver_port": "",
+    "host_port": "",
+    "baudrate": 115200
+  },
+  "output_dir": "deliveries",
+  "host_workspace": "C:/JK808_Windows/jobs",
+  "clock_sync": {
+    "ntp_servers": [
+      "ntp.aliyun.com",
+      "ntp1.aliyun.com"
+    ],
+    "max_offset_s": 0.25
+  },
+  "report": {
+    "project": "",
+    "batch": "",
+    "capacity": "",
+    "platform": "",
+    "cpu": "",
+    "os": "Windows 11",
+    "test_version": "",
+    "system_disk_model": "",
+    "time_tolerance_s": 2.0,
+    "surface_tolerance_s": 0.75,
+    "expected_serial": ""
+  },
+  "network": {
+    "online_adapter_guid": ""
+  },
+  "hwinfo": {
+    "executable": "",
+    "encoding": "gb18030",
+    "delimiter": ",",
+    "date_column": "Date",
+    "time_column": "Time",
+    "datetime_format": "%d.%m.%Y %H:%M:%S.%f",
+    "decimal_mark": ".",
+    "columns": {
+      "Composite": "Drive Temperature [°C]",
+      "CPU": "Drive Temperature 2 [°C]",
+      "NAND": "Drive Temperature 3 [°C]"
+    },
+    "required_metrics": [
+      "Composite",
+      "CPU",
+      "NAND"
+    ],
+    "mapping_verified": true,
+    "ui": {
+      "window": {
+        "title_re": "HWiNFO.*32 v8\\.34-5870 Sensors Status.*",
+        "class_name": "#32770"
+      },
+      "startup_actions": [],
+      "start_logging_actions": [],
+      "stop_logging_actions": [],
+      "interval_actions": [],
+      "adapter": "hwinfo_834",
+      "backend": "win32"
+    },
+    "smart_refresh_verified": false,
+    "expected_sensor_group": "",
+    "expected_header": [
+      "Date",
+      "Time",
+      "Drive Temperature [°C]",
+      "Drive Temperature 2 [°C]",
+      "Drive Temperature 3 [°C]",
+      "Drive Remaining Life [%]",
+      "Drive Available Spare [%]",
+      "Drive Failure [Yes/No]",
+      "Drive Warning [Yes/No]",
+      "Total Host Writes [GB]",
+      "Total Host Reads [GB]",
+      ""
+    ],
+    "source": "usb",
+    "usb": {}
+  },
+  "local_video": {
+    "file": "",
+    "ui": {
+      "window": {
+        "title_re": ".*媒体播放器.*"
+      },
+      "play_actions": [],
+      "stop_actions": [],
+      "position_control": {},
+      "position_pattern": "(\\d+:\\d+(?::\\d+)?)"
+    }
+  },
+  "online_video": {
+    "url": "",
+    "browser": "msedge",
+    "profile": "browser_profile",
+    "quality_selector": "",
+    "quality_text": "1080P",
+    "frame_rate": 30,
+    "quality_open_selector": "",
+    "page_retry_count": 5
+  },
+  "burnintest": {
+    "executable": "C:/Program Files/BurnInTest/bit.exe",
+    "configuration": "",
+    "configuration_sha256": "",
+    "system_disk_file_test_verified": false,
+    "ui": {
+      "window": {
+        "title_re": ".*BurnInTest.*"
+      },
+      "running_control": {},
+      "running_text_re": "",
+      "stop_actions": [],
+      "save_result_actions": []
+    }
+  },
+  "thermometer": {
+    "channel_count": 8,
+    "active_channels": [
+      1,
+      2,
+      3
+    ],
+    "channel_map": {
+      "CPU_Surface": 1,
+      "NAND_Surface": 2,
+      "AMB": 3
+    },
+    "timeout_s": 0.75,
+    "unit": "C",
+    "invalid_raw_values": [],
+    "valid_min_c": -200.0,
+    "valid_max_c": 1800.0,
+    "protocol_verified": false,
+    "hid_path_hex": "",
+    "hid_data_format": "v13"
+  },
+  "tests": {
+    "idle": {
+      "duration_s": 1500,
+      "interval_s": 60,
+      "points": 10,
+      "wait_before_s": 120,
+      "network": "offline"
+    },
+    "local_video": {
+      "duration_s": 1200,
+      "interval_s": 60,
+      "points": 12,
+      "wait_before_s": 120,
+      "network": "offline"
+    },
+    "online_video": {
+      "duration_s": 1200,
+      "interval_s": 60,
+      "points": 12,
+      "wait_before_s": 120,
+      "network": "online"
+    },
+    "bit": {
+      "duration_s": 900,
+      "interval_s": 30,
+      "points": 20,
+      "wait_before_s": 120,
+      "network": "offline"
+    }
+  },
+  "config_updates": {
+    "wait_before_120s_20261021": true
+  }
+}

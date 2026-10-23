@@ -1,0 +1,5 @@
+# Preserve exact bytes: the launcher validates published files with SHA256.
+* -text
+LICENSE text eol=lf
+*.xlsx binary
+*.bitcfg binary

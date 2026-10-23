@@ -1,0 +1,84 @@
+{
+  "_填写说明": "唯一配置文件。A 查盘后必须确认项目/批次归属，再保存 IP、明文密码和盘信息。同项目同批次的 512G/1T/2T 共用一本表。sample_assignment 由 A 自动记录，不要手填。B→1 测 L1.2，B→2 连跑 L0、写、读，B→3 单项测试，任选 L1.2、L0、写、读，只跑一项。各入口可自由选择。BIOS 人工设置。读写正式记录和 fio 均为 900 秒。",
+  "deployment_complete": false,
+  "sample_assignment": null,
+  "company_report": {
+    "project": "",
+    "batch": "",
+    "capacity": "",
+    "expected_serial": "",
+    "test_version": "",
+    "output_dir": "deliveries",
+    "window": "last_600s",
+    "decimal_places": 0
+  },
+  "ssh": {
+    "host": "",
+    "port": 22,
+    "username": "root",
+    "password": "",
+    "password_env": "JK500_SSH_PASSWORD",
+    "key_filename": "",
+    "known_hosts": "",
+    "device": "",
+    "expected_pci": "",
+    "allow_destructive": false,
+    "smart_temperature_unit": "K",
+    "smart_round_up": true,
+    "command_timeout_s": 15.0,
+    "clock_tolerance_s": 2.0,
+    "host_key": null
+  },
+  "thermometer": {
+    "channel_count": 8,
+    "active_channels": [
+      1,
+      2,
+      3
+    ],
+    "channel_map": {
+      "CPU_Surface": 1,
+      "NAND_Surface": 2,
+      "AMB": 3
+    },
+    "timeout_s": 0.75,
+    "unit": "C",
+    "invalid_raw_values": [],
+    "valid_min_c": -200.0,
+    "valid_max_c": 1800.0,
+    "protocol_verified": false,
+    "hid_path_hex": "",
+    "hid_data_format": "v13"
+  },
+  "tests": {
+    "read_1m": {
+      "duration_s": 900,
+      "fio_duration_s": 900,
+      "smart_interval_s": 60
+    },
+    "write_1m": {
+      "duration_s": 900,
+      "fio_duration_s": 900,
+      "smart_interval_s": 60
+    },
+    "l0_ps4": {
+      "duration_s": 1500,
+      "smart_interval_s": 60
+    },
+    "l12_ps4": {
+      "duration_s": 2000,
+      "smart_interval_s": 1500
+    }
+  },
+  "report": {
+    "initial_smart_scope": "round"
+  },
+  "detected_disk": {},
+  "clock_sync": {
+    "_说明": "B 每次测试前由接收电脑联网获取标准时间，再经 SSH 校准 Linux 和 Windows。Linux 无需联网。",
+    "ntp_servers": [
+      "ntp.aliyun.com",
+      "ntp1.aliyun.com"
+    ]
+  }
+}
