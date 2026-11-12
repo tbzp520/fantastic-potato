@@ -10,15 +10,17 @@ import json
 import math
 import os
 import tempfile
+import sys
 import unittest
 from unittest.mock import patch, Mock
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT))
 spec = importlib.util.spec_from_file_location('temperature_program',ROOT/'linux_temperature_test.py')
 program = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(program)
-CONFIG = json.loads((ROOT/'config.json').read_text('utf-8'))
+CONFIG = json.loads((ROOT/'config.example.json').read_text('utf-8'))
 EPOCH = 1790000000
 
 
@@ -621,10 +623,9 @@ class WorkbookTests(unittest.TestCase):
                     for label in ('CPU','NAND'):
                         first=lines[label].get_ydata()[0]
                         self.assertFalse(pd.isna(first))
-                    # scatter 的 masked 点不可见；不允许只删曲线、还留下散点。
-                    offsets=axis.collections[0].get_offsets()
-                    self.assertFalse(offsets.mask[0].any());self.assertTrue(offsets.mask[1].all())
-                    self.assertFalse(offsets.mask[2].any())
+                    # v2.3.3统一原始实线，不描点、不标逐点值；缺失仍在折线中断开。
+                    self.assertEqual(len(axis.collections),0)
+                    self.assertEqual(len(axis.texts),0)
                 else:
                     self.assertEqual(composite.get_ydata()[0],70)
                 self.assertEqual(smart,original)

@@ -3,12 +3,12 @@ from pathlib import Path
 import zipfile, re, uuid, math
 from xml.sax.saxutils import escape
 import xml.etree.ElementTree as ET
+from capacity_template import CAPACITIES, LEGACY_CAPACITIES, sheet_map, capacity_sheet_index, ensure_capacity_sheets, drawing_parts, ensure_png_type
 PROGRAM_FOLDER=Path(__file__).resolve().parent
 S='http://schemas.openxmlformats.org/spreadsheetml/2006/main'
 X='http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing'
 R='http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 P='http://schemas.openxmlformats.org/package/2006/relationships'
-CAPACITIES=('512G','1T','2T')
 BLOCKS={'idle':(7,11),'local_video':(16,20),'online_video':(25,29),'bit':(34,38)}
 
 def read_xlsx_parts(path):
@@ -85,9 +85,12 @@ def format_temperature_cells(data, sheet_key, addresses):
 def validate_company_template(data):
     wb = ET.fromstring(data['xl/workbook.xml'])
     names = [e.get('name') for e in wb.findall(f'{{{S}}}sheets/{{{S}}}sheet')]
-    if names[:3] != [c + '-温度' for c in CAPACITIES]:
+    if names[:3] != [c + '-温度' for c in LEGACY_CAPACITIES]:
         raise ValueError('模板工作表须依次为 512G-温度、1T-温度、2T-温度')
-    for i in range(1, 4):
+    for capacity in CAPACITIES:
+        if capacity+'-温度' not in sheet_map(data):
+            continue
+        i = capacity_sheet_index(data, capacity)
         sheet = ET.fromstring(data[f'xl/worksheets/sheet{i}.xml'])
         merges = {e.get('ref') for e in sheet.findall(f'.//{{{S}}}mergeCell')}
         if not {'A51:B57', 'A60:B66', 'A69:B75', 'A78:B84'} <= merges:
@@ -96,19 +99,22 @@ def validate_company_template(data):
 def create_empty_company_template(source, destination):
     data = read_xlsx_parts(source)
     validate_company_template(data)
+    ensure_capacity_sheets(data, replace_template_cells)
     # 新批次必须清空历史 Windows 和 Linux 结果、平台信息及所有旧图。
     addresses = [f'B{r}' for r in (1, 2, 3, 4, 5, 44, 45, 46, 47, 48)]
     addresses += [f'{c}{r+o}' for r in (11, 20, 29, 38, 53, 62, 71, 80)
                   for o in (0, 2, 4) for c in 'CDE']
-    for i, capacity in enumerate(CAPACITIES, 1):
+    for capacity in CAPACITIES:
+        i = capacity_sheet_index(data, capacity)
         values = dict.fromkeys(addresses)
         values.update({'B4': capacity, 'B47': capacity, 'C43': None})
         for row in (8, 17, 26, 35, 50, 59, 68, 77):
             values[f'C{row}'] = '未测试'
         name = f'xl/worksheets/sheet{i}.xml'
         data[name] = replace_template_cells(data[name], values)
-        data[f'xl/drawings/drawing{i}.xml'] = f'<xdr:wsDr xmlns:xdr="{X}"/>'.encode()
-        data[f'xl/drawings/_rels/drawing{i}.xml.rels'] = f'<Relationships xmlns="{P}"/>'.encode()
+        drawing_key,drawing_rels=drawing_parts(data,i)
+        data[drawing_key] = f'<xdr:wsDr xmlns:xdr="{X}"/>'.encode()
+        data[drawing_rels] = f'<Relationships xmlns="{P}"/>'.encode()
     for name in list(data):
         if name.startswith('xl/media/'):
             del data[name]
@@ -132,7 +138,7 @@ def replace_company_chart(data, index, mode, png):
         merges = {e.get('ref') for e in sheet.findall(f'.//{{{S}}}mergeCell')}
         if reserved not in merges:
             raise ValueError(f'模板缺少图片预留合并区域 {reserved}，不能自动填图')
-    key = f'xl/drawings/drawing{index}.xml'
+    key,rel_key = drawing_parts(data,index)
     xml = data[key].decode('utf-8')
     # 删除本项目区域的旧图片；其他 Windows / Linux 对象保持原字节。
     pattern = r'<(?:\w+:)?(?:twoCellAnchor|oneCellAnchor)\b[^>]*>.*?</(?:\w+:)?(?:twoCellAnchor|oneCellAnchor)>'
@@ -143,7 +149,6 @@ def replace_company_chart(data, index, mode, png):
     xml = re.sub(pattern, remove, xml, flags=re.S)
     media = f'auto_windows_{index}_{mode}.png'
     rid = 'rAuto_' + mode
-    rel_key = f'xl/drawings/_rels/drawing{index}.xml.rels'
     rels = ET.fromstring(data[rel_key])
     for rel in list(rels):
         if rel.get('Id') == rid:
@@ -162,12 +167,14 @@ def replace_company_chart(data, index, mode, png):
     else:
         xml = re.sub(r'</(?:\w+:)?wsDr>', lambda m: pic+m[0], xml)
     data[key] = xml.encode('utf-8')
+    ensure_png_type(data)
     data['xl/media/'+media] = Path(png).read_bytes()
 
 def fill_windows_result(destination, capacity, mode, statistics, metadata, png, count, warning, status=''):
     parts=read_xlsx_parts(destination)
     validate_company_template(parts)
-    index=CAPACITIES.index(capacity)+1
+    ensure_capacity_sheets(parts, replace_template_cells)
+    index=capacity_sheet_index(parts,capacity)
     _,row=BLOCKS[mode]
     values={f'B{r}':metadata.get(k) or '未提供' for r,k in
             ((1,'platform'),(2,'cpu'),(3,'os'))}

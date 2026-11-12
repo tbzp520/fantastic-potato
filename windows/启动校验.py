@@ -5,11 +5,17 @@ from pathlib import Path
 import re
 import sys
 
-EXPECTED_VERSION='0.4.12 在线视频优先版'
+EXPECTED_VERSION='0.4.22 登录后全屏修复版'
 REQUIRED_FILES={'windows_temperature_test.py','集中联调.py','serial_link.py','hardware_support.py',
                 'temperature_report.py','runtime_check.py','启动校验.py','统一启动.cmd',
                 '开始_测试主机.cmd','开始_接收电脑.cmd','repair_runtime.ps1','media_session.py',
                 'environment_setup.py','配置环境.cmd'}
+REQUIRED_FILES.update({'runtime_integrity.py','bootstrap_check.ps1'})
+REQUIRED_FILES.add('batch_report.py')
+REQUIRED_FILES.add('capacity_template.py')
+REQUIRED_FILES.add('native_edge.py')
+REQUIRED_FILES.add('platform_identity.py')
+REQUIRED_FILES.add('portable_tools.py')
 
 
 def verify_release(root=None, loaded_version=None, loaded_program=None):

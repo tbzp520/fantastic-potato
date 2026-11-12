@@ -1,11 +1,43 @@
-# Linux 测试端 v2.2.4
+# Linux 测试端 v2.3.4
 
-本目录的控制程序运行在 Windows 接收电脑，通过 SSH 控制 Linux 测试主机。
-直接使用者请下载 Releases 中的完整包；完整包含离线 wheelhouse。
+控制程序运行在 Windows 接收电脑，通过 SSH 控制一台或两台 Linux 测试主机；双机共用一台八通道 JK808，各自使用独立身份、探针和结果目录。
 
-源码运行前，把 config.example.json 复制为 config.json，安装 Python 3.12 和 requirements.lock 中的依赖，再运行「开始测试.cmd」。
-读写测试对指定盘执行 TRIM，会清除测试盘数据。请只连接专用测试盘并在 A 部署时核对型号、序列号、项目和批次。
+## 下载与首次准备
 
-A：首次部署或换盘更新。B→1：L1.2；B→2：L0、写、读连跑；B→3：四项任选一项单独测试。
-L1.2 完成后提示人工关机、调整 BIOS。详细步骤见「使用说明.md」。
-config.json 和配置备份可能含明文 SSH 密码，已列入 .gitignore。
+直接使用可下载发布页 `JK808_Linux_v2.3.4_full.zip` 及 `.zip.sha256`，完整附件包含指定版本的离线 wheelhouse。GitHub 的 Source code ZIP 和本源码目录不包含运行环境或 wheelhouse。
+
+源码首次使用先把 `config.example.json` 复制为 `config.json`，填写自己的 SSH 主机和配置。在 Windows 安装 Python 3.12 x64，并准备锁定依赖：
+
+```powershell
+python -m pip download --require-hashes -r requirements.lock --dest wheelhouse
+```
+
+也可带入同版本、受信的离线 wheelhouse。A 部署继续按原逻辑从本目录 wheelhouse 离线安装依赖。不要把实际 SSH 配置、仪器身份或密码提交到仓库。
+
+运行「开始测试.cmd」。入口检查 Python 3.12 x64 和实际目录；失效 `.venv` 会先保留备份，再交给原部署流程重建。启动失败保留窗口和「启动记录」，不要直接双击 `.py`。如需校时，按操作指导以管理员身份启动。
+
+## 更新已有环境
+
+先等正在运行的测试结束，退出旧程序。完整包解压到新目录并分别复制原 `config.json`、已有的 `双机配置.json`；不要复制旧 `.venv`。更新附件 `_update.zip` 不含配置、模板或 wheelhouse，解压到原目录后继续使用原依赖和现场配置。
+
+公开模板只保留原三个容量工作表及版式，没有温度数据或图片；`capacity_template.py` 按需追加 128G、256G，支持五种容量。旧批次已有数据按原汇总规则保留。
+
+## 单机与双机流程
+
+入口 1 保留原单机；入口 2 为一对二双机。双机首次从单机配置生成 `双机配置.json`，需分别完成 A、B 的 SSH、盘身份、项目批次与探针确认；不会复制 A 的写盘许可给 B。默认 A 用探针 1～3、B 用 4～6。
+
+A 部署或换盘更新；B 选择 L1.2、L0→写→读或单项；C 查看状态；D 取消所选主机；0 / Ctrl+C 等待运行项收尾后退出。某台失败不自动停止另一台，共用仪器故障可能同时影响两台。
+
+L1.2 后由测试人员手动关机、调整 BIOS，再继续其他项目。读写正式记录和 fio 均为 900 秒，SMART 每 5 秒采集，最后 600 秒每 30 秒选一个真实点，共 20 点；L0、L1.2 保留自己的采样规则。JK808 始终每秒记录。
+
+**读写项会执行 TRIM，清除指定盘数据。只能对核对过身份、未挂载的专用测试盘授权；禁止对系统盘或需保留数据的盘授权。**
+
+账号凭据按当前程序约定保存在本地配置；结果快照清除密码。公开配置中的 SSH、盘身份、仪器绑定和写盘许可均为空或关闭，实际密码、地址和许可只在自己的部署目录填写。
+
+## 结果与验证
+
+双机结果在 `deliveries_dual/主机A` 和 `主机B` 下分别保存。同项目同批次按容量汇总，单机/双机都有完整原始 SMART、JK808 秒级记录、对齐选点和统计的中文 CSV/HTML。复算目录里的 `raw_host_export.py`、`report_sampling.py` 等文件须一起保留。
+
+详细步骤见 [使用说明.html](使用说明.html)。当前变更有离线模拟回归，真实 SSH、5 秒 SMART 和双机硬件表现需在使用环境确认。
+
+源码测试：`python -m unittest discover -s tests -v`。测试依赖见 `requirements.lock`；部分只读表格测试另需 `openpyxl`。实际采集和写盘仅按部署指导执行。

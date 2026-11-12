@@ -16,17 +16,20 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import windows_temperature_test as app
 import temperature_report as report
 import company_template as template
+from platform_fixtures import attach_platform
 
 
 def configuration():
     cfg=json.loads((app.ROOT/'config.example.json').read_text('utf-8-sig'))
     cfg['report']['capacity']='1T'
+    cfg['report'].update(project='离线测试',batch='fixture-batch',system_disk_model='UNIT-TEST-SSD',expected_serial='UNIT-SSD-001')
+    cfg['online_video']['url']='https://www.bilibili.com/video/BVoffline/'
     hw=cfg['hwinfo']
     hw.pop('expected_header',None);hw.pop('expected_sensor_group',None)
     hw.update(encoding='utf-8-sig',delimiter=',',date_column='Date',time_column='Time',
         datetime_format='%d.%m.%Y %H:%M:%S.%f',decimal_mark='.',
         columns={'Composite':'T1','CPU':'T2','NAND':'T3'})
-    return cfg
+    return attach_platform(cfg)
 
 
 class Clock:
@@ -92,7 +95,8 @@ def write_fixture(folder,mode='idle'):
     folder.mkdir(parents=True,exist_ok=True)
     conditions={'mode':mode,'start_epoch':start,'end_epoch':start+setting['duration_s'],
         'interval_s':setting['interval_s'],'points':setting['points'],
-        'hwinfo':cfg['hwinfo'],'workload_status':'完成计时'}
+        'hwinfo':cfg['hwinfo'],'workload_status':'完成计时',
+        **{k:setting[k] for k in ('plot_interval_s','window_s') if k in setting}}
     app.save_json(folder/'conditions.json',conditions)
     with (folder/'hwinfo.csv').open('w',encoding='utf-8-sig',newline='') as stream:
         writer=csv.writer(stream);writer.writerow(['Date','Time','T1','T2','T3'])
@@ -188,7 +192,7 @@ class ReportTests(unittest.TestCase):
 
 
 class WholeFlowTests(unittest.TestCase):
-    def simulate(self, directory, *, cleanup_failure=False, cancel=False, restore_failure=False, online_fps=30, online_quality=None):
+    def simulate(self, directory, *, cleanup_failure=False, cancel=False, restore_failure=False, online_fps=30, online_quality=None, skip_first_wait=False):
         cfg=configuration();clock=Clock();actions=[];logging={}
         if online_quality is not None: cfg['online_video']['adapter']='bilibili_1080'
         cfg['host_workspace']=str(Path(directory)/'jobs')
@@ -245,7 +249,7 @@ class WholeFlowTests(unittest.TestCase):
             for name,value in replacements.items():stack.enter_context(patch.object(app,name,value))
             stack.enter_context(patch.object(app.time,'time',clock.time))
             stack.enter_context(patch.object(app.time,'monotonic',clock.monotonic))
-            host.run_job(cfg,list(app.ORDER))
+            host.run_job(cfg,list(app.ORDER),skip_first_wait)
         return cfg,clock,actions,host
 
     def test_four_stages_full_timing_transfer_and_company_workbook(self):
@@ -255,7 +259,7 @@ class WholeFlowTests(unittest.TestCase):
             self.assertEqual([a[1] for a in actions if a[0]=='network'],['online','offline','offline','offline'])
             self.assertEqual([a[1] for a in actions if a[0]=='log_start'],['online_video','idle','local_video','bit'])
             self.assertEqual([a[1] for a in actions if a[0]=='wait'],[120,120,120,120])
-            self.assertEqual([a[2] for a in actions if a[0]=='log_start'],[60,60,60,30])
+            self.assertEqual([a[2] for a in actions if a[0]=='log_start'],[5,60,5,5])
             self.assertEqual(len([a for a in actions if a[0]=='log_stop']),4)
             self.assertEqual(clock.now,1500+1200+1200+900+4*120)
             class Link:
@@ -266,7 +270,7 @@ class WholeFlowTests(unittest.TestCase):
                 'CPU_Surface':48,'NAND_Surface':43,'AMB':24})+'\n' for i in range(int(clock.now)))
             (manual/'jk808.jsonl').write_text(raw,'utf-8')
             summaries=app.finish_reports(cfg,result,list(app.ORDER))
-            self.assertEqual([summaries[m]['selected_count'] for m in app.ORDER],[12,10,12,20])
+            self.assertEqual([summaries[m]['selected_count'] for m in app.ORDER],[20,10,20,120])
             self.assertTrue(json.loads((manual/'任务结果.json').read_text('utf-8'))['completed'])
             parts=template.read_xlsx_parts(result/app.report_filename(cfg,'温度汇总','.xlsx'))
             for mode in app.ORDER:
@@ -275,7 +279,7 @@ class WholeFlowTests(unittest.TestCase):
                 with (manual/'主机数据'/mode/'选中绘图及统计点.csv').open(encoding='utf-8-sig') as stream:
                     rows=list(csv.DictReader(stream))
                 self.assertEqual(float(rows[0]['plot_second']),0)
-                self.assertEqual(float(rows[-1]['plot_second']), (len(rows)-1)*cfg['tests'][mode]['interval_s'])
+                self.assertEqual(float(rows[-1]['plot_second']), (len(rows)-1)*cfg['tests'][mode].get('plot_interval_s',cfg['tests'][mode]['interval_s']))
             self.assertEqual(sorted(p.suffix for p in result.iterdir() if p.is_file()),['.html']*5+['.png']*4+['.xlsx'])
 
     def test_stop_failure_prevents_second_load_and_preserves_restore_record(self):

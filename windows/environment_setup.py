@@ -77,8 +77,10 @@ def installation_lock(directory):
 
 def select_ftdi_port(current, ports):
     """保留仍有效的COM；仅有一个新候选时自动更新，多个候选不能猜选。"""
-    if current in ports:
-        return current
+    ports = list(dict.fromkeys(str(port).strip().upper() for port in ports))
+    wanted = str(current or '').strip().upper()
+    if wanted in ports:
+        return wanted
     if len(ports) == 1:
         return ports[0]
     raise RuntimeError('没有找到唯一FTDI COM口；当前候选：'+str(ports)+'。请接好线并核对端口')

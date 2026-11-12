@@ -6,6 +6,6 @@ requirements.lock records exact versions and SHA-256 checksums.
 The supplied company workbook template and the company-specific plot conventions retain
 their original ownership. The test implementation is readable in linux_temperature_test.py;
 it does not load or install a private test-framework package. Original input archives were
-not modified. SSH login passwords may be saved in the local config.json as requested by the operator. Never commit the populated file or its backups.
+not modified. SSH passwords may be saved in the local config.json at the operator's request. Never publish the populated file or its backups.
 
 No vendor USB driver, vendor application, Python installer, or Linux executable is bundled.

@@ -74,7 +74,9 @@ class AdaptivePictureTests(unittest.TestCase):
         workbook = self.folder/'result.xlsx'
         program.create_empty_company_template(ROOT/'温度模版_原始.xlsx', workbook)
         self.parts = program.read_xlsx_parts(workbook)
-        for index in (1, 2, 3):
+        from capacity_template import capacity_sheet_index
+        for capacity in program.CAPACITIES:
+            index = capacity_sheet_index(self.parts,capacity)
             for mode in program.BLOCKS:
                 program.replace_company_chart(self.parts, index, mode, self.png)
         program.save_xlsx_parts(self.parts, workbook)

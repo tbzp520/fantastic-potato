@@ -32,9 +32,13 @@ import uuid
 import zipfile
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
+from capacity_template import CAPACITIES, LEGACY_CAPACITIES, sheet_map, capacity_sheet_index, ensure_capacity_sheets, capacity_from_bytes, drawing_parts, ensure_png_type
+from report_sampling import PROFILE as REPORT_PROFILE, migrate_rw_sampling, selected_report_rows
+from raw_host_export import export_raw_host_data
 
 PROGRAM_FOLDER = Path(__file__).resolve().parent
 CONFIGURATION_FILE = PROGRAM_FOLDER / 'config.json'
+WORKFLOW_FOLDER = None  # 双机入口为每台指定目录；单机按当前 PROGRAM_FOLDER 保存。
 TEST_NAMES = {'read_1m': 'Linux_1M_Read', 'write_1m': 'Linux_1M_Write',
               'l0_ps4': 'Linux_L0_PS4', 'l12_ps4': 'Linux_L1_2_PS4'}
 METRICS = ['CPU_Surface', 'NAND_Surface', 'AMB', 'Composite', 'CPU', 'NAND', 'BW(MiB/s)']
@@ -58,6 +62,9 @@ def utc_timestamp(epoch=None):
 def load_configuration():
     configuration = json.loads(CONFIGURATION_FILE.read_text('utf-8-sig'))
     upgrade_read_write_duration(configuration)
+    if migrate_rw_sampling(configuration):
+        save_configuration(configuration)
+        print('已备份并升级读写采样：SMART每5秒，最后10分钟每30秒取点，共20点；L0/L1.2不变。',flush=True)
     configuration['_config_dir'] = str(PROGRAM_FOLDER)
     return configuration
 
@@ -239,12 +246,19 @@ def collect_during_formal_test(configuration, mode, linux_connection, smart_conn
     settings = configuration['tests'][mode]
     duration = settings['duration_s']
     surface_rows, smart_rows, bandwidth_rows, errors = [], [], [], []
-    start_monotonic = time.monotonic()
-    start_epoch = time.time()
+    dual = configuration.get('_dual_control')
+    if dual is None:
+        start_monotonic = time.monotonic()
+        start_epoch = time.time()
+    else:
+        start_monotonic, start_epoch = dual.formal_start_point()
     state = {'mode':mode,'started_at':utc_timestamp(start_epoch),'start_epoch':start_epoch,
              'duration_s':duration,'smart_interval_s':settings['smart_interval_s'],
              'identity':configuration.get('_identity',{}),
              'completed':False,'errors':errors,'configuration':configuration_without_password(configuration)}
+    if mode in ('read_1m','write_1m') and settings.get('sampling_profile') == REPORT_PROFILE:
+        state.update(sampling_profile=REPORT_PROFILE,report_interval_s=settings['report_interval_s'],
+                     report_points=settings['report_points'])
     save_json(output_folder/'本次运行记录.json',state)
     threads = [threading.Thread(target=collect_jk808_every_second, name='JK808 每秒采样',args=(configuration,start_epoch,start_monotonic,duration,stop_event,output_folder,surface_rows,errors)),
                threading.Thread(target=collect_smart_at_scheduled_times, name='SMART 计划采样',args=(configuration,smart_connection,start_epoch,start_monotonic,duration,settings['smart_interval_s'],stop_event,output_folder,smart_rows,errors))]
@@ -252,6 +266,8 @@ def collect_during_formal_test(configuration, mode, linux_connection, smart_conn
     try:
         for thread in threads:
             thread.start()
+        if dual is not None and stop_event.wait(max(0,start_monotonic-time.monotonic())):
+            raise InterruptedError('操作员在正式起点前取消')
         print('正式测试开始，现开始采样。',flush=True)
         if mode in ('read_1m','write_1m'):
             direction = 'read' if mode=='read_1m' else 'write'
@@ -344,7 +360,8 @@ def collect_during_formal_test(configuration, mode, linux_connection, smart_conn
             except Exception as error:
                 errors.append('取回/读取 fio 原始日志失败：'+str(error)+'；远端目录：'+fio_state['remote_folder'])
         save_json(output_folder/'本次运行记录.json',state)
-    generate_all_test_results(configuration,state,output_folder,surface_rows,smart_rows,bandwidth_rows)
+    with (dual.report_lock if dual is not None else nullcontext()):
+        generate_all_test_results(configuration,state,output_folder,surface_rows,smart_rows,bandwidth_rows)
     return state
 
 
@@ -357,6 +374,9 @@ def append_json_record(stream, record):
 
 def collect_jk808_every_second(configuration, start_epoch, start_monotonic, duration_seconds, stop_event, output_folder, rows, fatal_errors):
     """第 0 秒开始。每秒有独立记录；断线、探头无效、晚到都记缺失，下一秒继续。"""
+    dual = configuration.get('_dual_control')
+    if dual is not None:
+        return dual.collect_surface(configuration,start_epoch,start_monotonic,duration_seconds,stop_event,output_folder,rows,fatal_errors)
     settings = configuration['thermometer']
     current_second = 0
     thermometer = None
@@ -434,7 +454,7 @@ def convert_nvme_smart_temperatures(raw_data, settings):
 
 
 def collect_smart_at_scheduled_times(configuration, linux_connection, start_epoch, start_monotonic, duration_seconds, interval_seconds, stop_event, output_folder, rows, fatal_errors):
-    """仅在 0、60、120… 或 0、1500… 取样；计划点失败留下记录，不额外密集轮询。"""
+    """读写0/5/10…，L0为0/60…，L1.2为0/1500；失败留下记录，不补采。"""
     try:
         with (output_folder/'SMART完整原始响应.jsonl').open('w', encoding='utf-8') as raw_stream, \
              (output_folder/'SMART计划采样数据.csv').open('w', encoding='utf-8-sig', newline='') as csv_stream:
@@ -531,9 +551,7 @@ def read_disk_identity(linux_connection, device):
     if not addresses:
         raise ValueError('未查到 PCI 地址')
     size = int(linux_connection.execute(f'blockdev --getsize64 {quoted}')[1])
-    capacity = next((label for label,nominal in [('512G',512e9),('1T',1e12),('2T',2e12)] if nominal*.85<=size<=nominal*1.12),None)
-    if capacity is None:
-        raise ValueError('此容量不在当前公司模板的 512G / 1T / 2T 中')
+    capacity = capacity_from_bytes(size, lower=.85, upper=1.12)
     return {'device':device, 'pci':addresses[-1].lower(), 'serial':str(controller.get('sn','')).strip(),
             'model':str(controller.get('mn','')).strip(), 'firmware':str(controller.get('fr','')).strip(),
             'capacity':capacity, 'capacity_bytes':size}
@@ -725,11 +743,23 @@ def generate_all_test_results(configuration, state, folder, surface_rows, smart_
     rejected, filter_notes = exclude_initial_smart_outliers(mode,smart_rows,interval,8,configuration['report']['initial_smart_scope'])
     statistics_input = remove_rejected_smart_values(raw_data,rejected,configuration['report']['initial_smart_scope'])
     left_second = max(0,duration-600) if configuration['company_report']['window']=='last_600s' else 0
-    statistics, selected = calculate_test_statistics(statistics_input,left_second,duration)
+    sparse_report = mode in ('read_1m','write_1m') and state.get('sampling_profile') == REPORT_PROFILE
+    report_issues = []
+    if sparse_report:
+        if interval != 5:
+            raise ValueError('新读写报告与原始SMART周期不一致，应为5秒')
+        left_second = duration-600
+        report_input, report_issues = selected_report_rows(statistics_input,duration,state['report_interval_s'],state['report_points'])
+    else:
+        report_input = statistics_input
+    statistics, selected = calculate_test_statistics(report_input,left_second,duration)
     notes = [f'统计区间：正式测试第 {left_second} 秒至第 {duration} 秒（不含终点）。',
              '剔除的 SMART 值不参与统计和绘图；完整基础数据保留原始值，缺失值不补零。',
              '读写前两次按 Composite 与后续均值相差达到 8℃ 判定；L0/L1.2 不做此剔除。']
     notes += filter_notes+state['errors']
+    if sparse_report:
+        notes.append(f'读写原始SMART每5秒，JK808每1秒。报告仅用最后600秒内每30秒的20个计划点绘图和统计，半开区间不包含第{duration}秒。')
+        notes += report_issues
     if rejected:
         notes.append(f'{len(rejected)} 个起始 SMART 采样点已从统计和图中排除，详见剔除记录')
     if not state['completed']:
@@ -740,7 +770,7 @@ def generate_all_test_results(configuration, state, folder, surface_rows, smart_
     save_csv_table(folder/'参与统计的数据.csv',DATA_COLUMNS+['Second'],selected)
     rejection_columns = ['计划时间','相对测试秒','Composite','后续Composite均值','差值绝对值','剔除阈值℃','剔除范围','说明']
     save_csv_table(folder/'SMART起始点剔除记录.csv',rejection_columns,rejected)
-    write_data_loss_notice(folder,missing,state['errors']+filter_notes)
+    write_data_loss_notice(folder,missing,state['errors']+filter_notes+report_issues)
     save_base_data_workbook(folder/'基础数据.xlsx',raw_data,selected,missing,statistics)
     data_parts = read_xlsx_parts(folder/'基础数据.xlsx')
     add_or_replace_data_sheet(data_parts,'剔除记录',rejection_columns,rejected)
@@ -750,6 +780,12 @@ def generate_all_test_results(configuration, state, folder, surface_rows, smart_
     chart_start_epoch = start_epoch+chart_start_second
     smart_plot_data = remove_rejected_smart_values(smart_rows,rejected,configuration['report']['initial_smart_scope'])
     chart_end_second = find_chart_end_second(smart_plot_data,duration,interval,chart_start_second)
+    if sparse_report:
+        chart_start_second = left_second
+        chart_start_epoch = start_epoch+chart_start_second
+        valid_ends = [row['Second'] for row in selected if isinstance(row.get('Composite'),(int,float))
+                      and not isinstance(row['Composite'],bool) and math.isfinite(row['Composite'])]
+        chart_end_second = max(valid_ends) if valid_ends else None
     notes.append(f'绘图第 0 秒 = 正式测试第 {chart_start_second} 秒，北京时间 {beijing_timestamp(chart_start_epoch)}。统计区间不因此改变。')
     if chart_end_second is None:
         notes.append('没有有效 SMART 截止点，本图不绘制曲线；原始数据、统计结果和缺失记录仍保留。')
@@ -772,10 +808,15 @@ def generate_all_test_results(configuration, state, folder, surface_rows, smart_
             continue
         smart_plot_rows.append({'Time':utc_timestamp(start_epoch+second),**{metric:by_second.get(second,{}).get(metric) for metric in METRICS[3:6]}})
     smart_frame = pd.DataFrame(smart_plot_rows)
+    if sparse_report:
+        plot_rows = [dict(row,Time=utc_timestamp(start_epoch+row['Second'])) for row in selected if within_chart(row['Second'])]
+        surface_frame = pd.DataFrame(plot_rows,columns=['Time']+METRICS[:3])
+        smart_frame = pd.DataFrame(plot_rows,columns=['Time']+METRICS[3:6])
+        bandwidth_frame = pd.DataFrame(plot_rows,columns=['Time']+METRICS[6:])
     chart = result_folder/'【最终结果+双轴图表】_双Y轴图表.png'
     figure = create_company_temperature_figure([(surface_frame,METRICS[:3],False),(smart_frame,METRICS[3:6],True),(bandwidth_frame,METRICS[6:],False)],
                                                TEST_NAMES[mode]+('（模拟）' if state.get('simulated') else ''),start=utc_timestamp(chart_start_epoch),mode=mode)
-    figure.savefig(chart,dpi=300,bbox_inches='tight')
+    figure.savefig(chart,dpi=300)
     import matplotlib.pyplot as plt
     plt.close(figure)
     write_temperature_html(result_folder/'测试报告.html',TEST_NAMES[mode],statistics,chart,missing,notes)
@@ -791,7 +832,10 @@ def generate_all_test_results(configuration, state, folder, surface_rows, smart_
         metadata = dict(state.get('identity',{}),test_version=company['test_version'],
                         sampling_label=f'多路测温仪温度曲线\n（表面温度每1秒采样，SMART每{interval}秒采样）')
         caption = '全程统计' if left_second==0 else '最后10min'
-        if missing or not state['completed'] or state['errors']:
+        if sparse_report:
+            caption = '最后10min / 30s取点'
+            metadata['sampling_label'] = '多路测温仪温度曲线\n（SMART每5秒，报告每30秒共20点）'
+        if missing or not state['completed'] or state['errors'] or report_issues:
             caption = '10min内（有异常）'
         # 模板显示位数沿用公司整数格式；基础数据、均值和复算公式保留精度。
         display_statistics = {metric:{key:(round(value,company['decimal_places']) if key!='count' and value is not None else value)
@@ -816,6 +860,28 @@ def generate_all_test_results(configuration, state, folder, surface_rows, smart_
         print('最终公司模板：'+str(target),flush=True)
         # 留存本次出表时的模板副本，之后同批次复测不会改变这个副本。
         shutil.copy2(target,folder/'本次出表时的温度模版.xlsx')
+    try:
+        export_raw_host_data(folder,smart_rows,surface_rows,selected,statistics,
+                             {'测试项目':TEST_NAMES[mode], 'start_epoch':start_epoch,
+                              'SMART原始温度单位':configuration['ssh']['smart_temperature_unit'],
+                              'SMART摄氏度向上取整':configuration['ssh']['smart_round_up'],
+                              '统计规则':'沿用本次采样和选点规则；原始全部记录不等于参与统计记录',
+                              '模拟数据':bool(state.get('simulated'))})
+        (folder/'原始数据导出提示.txt').unlink(missing_ok=True)
+    except Exception as error:
+        # 查看副本故障不能把已完成采集和正式出表改成待重跑测试；可离线重建副本。
+        notice = '原始主机数据查看副本未完整生成，请用已有记录重建报告，无需重新测试：'+str(error)
+        print(notice,flush=True)
+        try:
+            (folder/'原始数据导出提示.txt').write_text(notice,'utf-8-sig')
+            report_path = result_folder/'测试报告.html'
+            report_text = report_path.read_text('utf-8')
+            report_path.write_text(report_text.replace('</h1>','</h1><p class="notice">'+escape(notice)+'</p>',1),'utf-8')
+            (folder/'原始主机数据').mkdir(exist_ok=True)
+            (folder/'原始主机数据/原始数据与选点统计.html').write_text(
+                '<!doctype html><meta charset="utf-8"><h1>查看副本未完整生成</h1><p>'+escape(notice)+'</p>','utf-8')
+        except OSError:
+            pass
     print(f'采样检查：{len(missing)} 条缺失/重复指标记录。详见“手工复测/先看数据完整性.txt”。',flush=True)
     print('全部基础数据：'+str(folder),flush=True)
     print('人工复算：双击 '+str(folder/'人工复算代码'/'开始复算.cmd'),flush=True)
@@ -1031,6 +1097,7 @@ def write_temperature_html(path, title, statistics, chart_path, missing_rows, no
     image = base64.b64encode(Path(chart_path).read_bytes()).decode()
     document = '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>'+escape(title)+'</title><style>body{font:16px/1.7 "Microsoft YaHei",sans-serif;background:#f5f7fa;margin:24px}main{max-width:1400px;margin:auto;background:white;padding:30px}h1{color:#2c3e50}table{border-collapse:collapse;width:100%}th{background:#367fa9;color:white}th,td{padding:10px;border-bottom:1px solid #ddd;text-align:center}.notice{background:#fff2cc;padding:14px}img{width:100%}pre{white-space:pre-wrap}</style><main><h1>'+escape(title)+'</h1>'
     document += '<p class="notice">'+escape('\n'.join(notes))+f'；缺失/异常记录：{len(missing_rows)} 条。完整基础数据和参与统计的数据见 <a href="手工复测/基础数据.xlsx">手工复测/基础数据.xlsx</a>。</p>'
+    document += '<p><a href="手工复测/原始主机数据/原始数据与选点统计.html">查看全部原始SMART、JK808每秒、对齐选点与统计</a></p>'
     document += '<table><tr><th>指标项</th><th>最大值</th><th>平均值</th><th>最小值</th></tr>'+''.join(rows)+'</table><img src="data:image/png;base64,'+image+'">'
     document += '<h2>缺失数据的具体时间点</h2><table><tr><th>计划时间（北京时间 UTC+8）</th><th>相对秒</th><th>来源</th><th>通道/指标</th><th>原因</th></tr>'+loss_table+'</table></main></html>'
     Path(path).write_text(document, 'utf-8')
@@ -1049,11 +1116,17 @@ def organize_manual_recalculation_files(configuration, state, folder, raw_data, 
                 'statistics_window_s':600,'outlier_threshold_c':8,
                 'initial_smart_scope':configuration['report']['initial_smart_scope'],
                 'decimal_places':configuration['company_report']['decimal_places'],
+                'SMART原始温度单位':configuration['ssh']['smart_temperature_unit'],
+                'SMART摄氏度向上取整':configuration['ssh']['smart_round_up'],
+                '模拟数据':bool(state.get('simulated')),
                 'chart_start_original_second':chart_start_second,
                 'chart_end_original_second':chart_end_second,
                 'identity':state.get('identity',{}),'sample':configuration['company_report'],
                 'completed':state['completed'],'errors':state['errors'],
                 '说明':'本文件是这次测试的固定复算条件，不是运行测试的配置文件。Second 为正式测试相对秒，未因图归零而改动。'}
+    for key in ('sampling_profile','report_interval_s','report_points'):
+        if key in state:
+            metadata[key] = state[key]
     save_json(data_folder/'本次复算条件.json',metadata)
     # 主出表流程已写入完整数据（含实际接收时间），不以精简列覆盖它。
     if not (data_folder/'完整基础数据.csv').exists():
@@ -1064,7 +1137,7 @@ def organize_manual_recalculation_files(configuration, state, folder, raw_data, 
     save_csv_table(data_folder/'基础数据_北京时间.csv',['北京时间']+DATA_COLUMNS+['Second','Phase'],beijing_rows)
     save_json(data_folder/'程序统计结果_仅供对照.json',statistics)
     # 原始 CSV、USB 日志、TRIM 记录和校时记录从创建时就写入本目录，无需另存重复副本。
-    for filename in ('复算温度.py','开始复算.cmd','复算说明.txt'):
+    for filename in ('复算温度.py','开始复算.cmd','复算说明.txt','report_sampling.py','raw_host_export.py'):
         shutil.copy2(PROGRAM_FOLDER/'人工复算代码'/filename,code_folder/filename)
     essential = ['本次复算条件.json','完整基础数据.csv','SMART原始计划点.csv']
     manifest = {name:hashlib.sha256((data_folder/name).read_bytes()).hexdigest() for name in essential}
@@ -1301,7 +1374,7 @@ def check_report_batch_disk_conflict(configuration, batch_folder):
     try:
         saved = json.loads(path.read_text('utf-8-sig')) if path.exists() else {}
         if not isinstance(saved,dict) or any(
-                capacity not in ('512G','1T','2T') or not isinstance(item,dict)
+                capacity not in CAPACITIES or not isinstance(item,dict)
                 or any(not isinstance(item.get(key),str) or not item[key] for key in ('serial','version','firmware'))
                 for capacity,item in saved.items()):
             raise ValueError('记录结构不正确')
@@ -1364,8 +1437,8 @@ def confirm_disk_project_and_batch(configuration, previous_sample):
     print(f"本次盘：{disk['device']} / {disk['model']} / {disk['capacity']} / SN={disk['serial']} / 固件={disk['firmware']}")
     if previous_sample.get('expected_serial'):
         print(f"原配置盘：{previous_sample.get('capacity','')} / SN={previous_sample['expected_serial']}")
-    if company['capacity'] not in ('512G','1T','2T'):
-        raise ValueError('本次容量不对应公司模板的 512G / 1T / 2T，未保存配置')
+    if company['capacity'] not in CAPACITIES:
+        raise ValueError('本次容量不对应公司模板的 128G / 256G / 512G / 1T / 2T，未保存配置')
     try:
         for key in ('project','batch'):
             validate_report_folder_name(company.get(key,''),key)
@@ -1413,8 +1486,8 @@ def validate_test_configuration(configuration, mode):
         raise ValueError('company_report.output_dir 应为目录文本；填 "" 使用程序目录下的 deliveries')
     if not company['expected_serial'] or not company['test_version']:
         raise ValueError('序列号和版本不能为空。盘信息可在 A 自动填写')
-    if company['capacity'] not in ('512G','1T','2T'):
-        raise ValueError('容量须与公司模板的 512G / 1T / 2T 对应')
+    if company['capacity'] not in CAPACITIES:
+        raise ValueError('容量须与公司模板的 128G / 256G / 512G / 1T / 2T 对应')
     validate_confirmed_disk_assignment(configuration)
     if company['window']!='last_600s':
         raise ValueError('当前确认的统计范围是最后 10 分钟，window 应为 last_600s')
@@ -1432,16 +1505,19 @@ def validate_test_configuration(configuration, mode):
     settings = configuration['tests'][mode]
     if type(settings['duration_s']) is not int or not 600<=settings['duration_s']<=86400:
         raise ValueError('正式采样时长须为 600..86400 秒整数，保证最后 10 分钟统计范围')
-    expected_interval = 1500 if mode=='l12_ps4' else 60
+    expected_interval = 1500 if mode=='l12_ps4' else (60 if mode=='l0_ps4' else 5)
     if settings['smart_interval_s']!=expected_interval:
         raise ValueError(f'本项保留的 SMART 周期应为 {expected_interval} 秒')
+    if mode in ('read_1m','write_1m') and (settings.get('sampling_profile') != REPORT_PROFILE
+            or settings.get('report_interval_s') != 30 or settings.get('report_points') != 20):
+        raise ValueError('读写项须使用SMART每5秒、报告每30秒共20点的新配置，请重新启动完成配置迁移')
     if mode in ('read_1m','write_1m'):
         if not configuration['ssh']['allow_destructive']:
             raise ValueError('读写两项会 TRIM，请先在 JSON 核对专用测试盘并设置 allow_destructive=true')
         if type(settings['fio_duration_s']) is not int or not 600<=settings['fio_duration_s']<=settings['duration_s']:
             raise ValueError('fio 持续时间必须至少 600 秒，且不能超过正式采样时间')
     validate_company_template(read_xlsx_parts(PROGRAM_FOLDER/'温度模版_原始.xlsx'))
-    for filename in ('复算温度.py','开始复算.cmd','复算说明.txt'):
+    for filename in ('复算温度.py','开始复算.cmd','复算说明.txt','report_sampling.py','raw_host_export.py'):
         if not (PROGRAM_FOLDER/'人工复算代码'/filename).is_file():
             raise ValueError('新版文件不完整：请把新包的整个“人工复算代码”文件夹复制到程序目录，再开始测试')
 
@@ -1494,7 +1570,8 @@ def execute_selected_test(configuration, mode, receiver_locked=False):
     linux_connection = LinuxConnection(configuration['ssh'])
     smart_settings = dict(configuration['ssh'],command_timeout_s=1)
     smart_connection = LinuxConnection(smart_settings)
-    stop_event = threading.Event()
+    dual = configuration.get('_dual_control')
+    stop_event = dual.make_stop_event() if dual is not None else threading.Event()
     with (nullcontext() if receiver_locked else lock_receiver_during_test()):
         # 在登录、校时之前就创建目录，准备阶段出错也有本次记录可查。
         output_folder = create_test_result_folder(configuration,mode)
@@ -1620,7 +1697,7 @@ def main():
         choose_and_run_test()
         return
     while True:
-        print('\nJK808 + Linux 温度测试 v2.2.4\nA. 首次部署 / 换盘后自动更新盘信息\nB. 执行测试\n0. 退出')
+        print('\nJK808 + Linux 温度测试 v2.3.4（单机入口）\nA. 首次部署 / 换盘后自动更新盘信息\nB. 执行测试\n0. 退出')
         choice = input('请选择 A 或 B：').strip().upper()
         try:
             if choice=='0':
@@ -1667,15 +1744,15 @@ def workflow_configuration_key(configuration):
 
 def save_workflow_progress(progress):
     """这是自动生成的运行进度，不是第二份配置。原始测次目录始终保留。"""
-    directory = PROGRAM_FOLDER/'运行记录'
-    directory.mkdir(exist_ok=True)
+    directory = WORKFLOW_FOLDER or PROGRAM_FOLDER/'运行记录'
+    directory.mkdir(parents=True,exist_ok=True)
     progress['updated_beijing'] = beijing_timestamp()
     save_json(directory/('流程_'+progress['id']+'.json'),progress)
     save_json(directory/'当前流程.json',progress)
 
 
 def load_workflow_progress():
-    path = PROGRAM_FOLDER/'运行记录'/'当前流程.json'
+    path = (WORKFLOW_FOLDER or PROGRAM_FOLDER/'运行记录')/'当前流程.json'
     if not path.exists():
         return None
     progress = json.loads(path.read_text('utf-8'))
@@ -1737,7 +1814,8 @@ def continue_l0_write_read(configuration):
     modes = ['l0_ps4','write_1m','read_1m']
     for mode in modes:
         validate_test_configuration(configuration,mode)
-    stop_event = threading.Event()
+    dual = configuration.get('_dual_control')
+    stop_event = dual.cancel_event if dual is not None else threading.Event()
     with lock_receiver_during_test():
         progress = load_workflow_progress()
         configuration_key = workflow_configuration_key(configuration)
@@ -2129,6 +2207,9 @@ def synchronize_receiver_clock(configuration, output_folder=None):
     3. Windows 对准同一标准，再对 Linux 微调；核对两机时差与标准时间。
     全过程不读取 SMART、不运行 fio、不刷 BIOS、不改变 NTP 服务配置。
     """
+    dual = configuration.get('_dual_control')
+    if dual is not None:
+        return dual.synchronize_host(configuration,output_folder)
     # 兼容旧文件，但测试前的联网校时不允许因旧开关 false 而静默跳过。
     ssh = configuration['ssh']
     tolerance = ssh.get('clock_tolerance_s',2)
@@ -2370,7 +2451,6 @@ R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 P = 'http://schemas.openxmlformats.org/package/2006/relationships'
 BLOCKS = {'l12_ps4': (49, 53), 'l0_ps4': (58, 62),
           'write_1m': (67, 71), 'read_1m': (76, 80)}
-CAPACITIES = ('512G', '1T', '2T')
 
 
 def read_xlsx_parts(path):
@@ -2425,9 +2505,12 @@ def replace_template_cells(xml, values):
 def validate_company_template(data):
     wb = ET.fromstring(data['xl/workbook.xml'])
     names = [e.get('name') for e in wb.findall(f'{{{S}}}sheets/{{{S}}}sheet')]
-    if names[:3] != [c + '-温度' for c in CAPACITIES]:
+    if names[:3] != [c + '-温度' for c in LEGACY_CAPACITIES]:
         raise ValueError('模板工作表须依次为 512G-温度、1T-温度、2T-温度')
-    for i in range(1, 4):
+    for capacity in CAPACITIES:
+        if capacity+'-温度' not in sheet_map(data):
+            continue
+        i = capacity_sheet_index(data, capacity)
         sheet = ET.fromstring(data[f'xl/worksheets/sheet{i}.xml'])
         merges = {e.get('ref') for e in sheet.findall(f'.//{{{S}}}mergeCell')}
         if not {'A51:B57', 'A60:B66', 'A69:B75', 'A78:B84'} <= merges:
@@ -2437,19 +2520,22 @@ def validate_company_template(data):
 def create_empty_company_template(source, destination):
     data = read_xlsx_parts(source)
     validate_company_template(data)
+    ensure_capacity_sheets(data, replace_template_cells)
     # 新批次必须清空历史 Windows 和 Linux 结果、平台信息及所有旧图。
     addresses = [f'B{r}' for r in (1, 2, 3, 4, 5, 44, 45, 46, 47, 48)]
     addresses += [f'{c}{r+o}' for r in (11, 20, 29, 38, 53, 62, 71, 80)
                   for o in (0, 2, 4) for c in 'CDE']
-    for i, capacity in enumerate(CAPACITIES, 1):
+    for capacity in CAPACITIES:
+        i = capacity_sheet_index(data, capacity)
         values = dict.fromkeys(addresses)
         values.update({'B4': capacity, 'B47': capacity, 'C43': None})
         for row in (8, 17, 26, 35, 50, 59, 68, 77):
             values[f'C{row}'] = '未测试'
         name = f'xl/worksheets/sheet{i}.xml'
         data[name] = replace_template_cells(data[name], values)
-        data[f'xl/drawings/drawing{i}.xml'] = f'<xdr:wsDr xmlns:xdr="{X}"/>'.encode()
-        data[f'xl/drawings/_rels/drawing{i}.xml.rels'] = f'<Relationships xmlns="{P}"/>'.encode()
+        drawing_key,drawing_rels=drawing_parts(data,i)
+        data[drawing_key] = f'<xdr:wsDr xmlns:xdr="{X}"/>'.encode()
+        data[drawing_rels] = f'<Relationships xmlns="{P}"/>'.encode()
     for name in list(data):
         if name.startswith('xl/media/'):
             del data[name]
@@ -2471,7 +2557,7 @@ def build_excel_picture_anchor(row, rid, object_id):
 
 def replace_company_chart(data, index, mode, png):
     row, _ = BLOCKS[mode]
-    key = f'xl/drawings/drawing{index}.xml'
+    key,rel_key = drawing_parts(data,index)
     xml = data[key].decode('utf-8')
     # 删除本项目区域的旧图片；其他 Windows / Linux 对象保持原字节。
     pattern = r'<(?:\w+:)?(?:twoCellAnchor|oneCellAnchor)\b[^>]*>.*?</(?:\w+:)?(?:twoCellAnchor|oneCellAnchor)>'
@@ -2482,7 +2568,6 @@ def replace_company_chart(data, index, mode, png):
     xml = re.sub(pattern, remove, xml, flags=re.S)
     media = f'auto_linux_{index}_{mode}.png'
     rid = 'rAuto_' + mode
-    rel_key = f'xl/drawings/_rels/drawing{index}.xml.rels'
     rels = ET.fromstring(data[rel_key])
     for rel in list(rels):
         if rel.get('Id') == rid:
@@ -2497,13 +2582,15 @@ def replace_company_chart(data, index, mode, png):
     else:
         xml = re.sub(r'</(?:\w+:)?wsDr>', lambda m: pic+m[0], xml)
     data[key] = xml.encode('utf-8')
+    ensure_png_type(data)
     data['xl/media/'+media] = Path(png).read_bytes()
 
 
 def fill_company_test_result(source, destination, capacity, mode, statistics, metadata, png, caption):
     data = read_xlsx_parts(source)
     validate_company_template(data)
-    index = CAPACITIES.index(capacity)+1
+    ensure_capacity_sheets(data, replace_template_cells)
+    index = capacity_sheet_index(data,capacity)
     _, first = BLOCKS[mode]
     values = {f'B{r}': metadata.get(k) or '未提供' for r, k in
               ((44, 'platform'), (45, 'cpu'), (46, 'os'), (48, 'test_version'))}
@@ -2526,15 +2613,15 @@ def fill_company_test_result(source, destination, capacity, mode, statistics, me
 
 
 
-# ---------- 沿用公司原图颜色与坐标 ----------
+# ---------- 所有模式共用确认的颜色、线宽与原始折线 ----------
 STYLES = {
-    'CPU_Surface': ('#D83A56', 'CPU表面', 0),
-    'NAND_Surface': ('#FF7F50', 'NAND表面', 0),
-    'AMB': ('#457B9D', '环境AMB', 0),
-    'Composite': ('#7209B7', '复合温度', 8),
-    'CPU': ('#9C6615', 'CPU', -8),
-    'NAND': ('#2D9596', 'NAND', -16),
-    'BW(MiB/s)': ('#69a3ff', '带宽 BW(MiB/s)', 0),
+    'CPU_Surface': ('#FF0000', 'CPU表面', 0),
+    'NAND_Surface': ('#4A91FA', 'NAND表面', 0),
+    'AMB': ('#228B22', '环境温度', 0),
+    'Composite': ('#7209B7', '复合温度', 0),
+    'CPU': ('#FF0000', 'CPU', 0),
+    'NAND': ('#4A91FA', 'NAND', 0),
+    'BW(MiB/s)': ('#A0A0A0', '带宽 BW(MiB/s)', 0),
 }
 
 
@@ -2571,7 +2658,7 @@ def create_company_temperature_figure(frames, title, start=None, mode=None):
     temperatures, bandwidth = [], []
     bandwidth_data = []
     for metric, data, sparse in prepared:
-        color, label, offset = STYLES[metric]
+        color, label, _ = STYLES[metric]
         seconds = (data.Time - origin).dt.total_seconds()
         values = data.Value
         is_bw = metric == 'BW(MiB/s)'
@@ -2580,17 +2667,9 @@ def create_company_temperature_figure(frames, title, start=None, mode=None):
             bandwidth_data.append((seconds,values))
             continue
         ax.plot(seconds, values, color=color, label=label,
-                  linewidth=1.5 if sparse else 2,
-                  linestyle='--' if sparse else '-', alpha=.8 if sparse else 1)
+                linewidth=1.7 if metric in METRICS[3:6] else .9,
+                linestyle='-', marker=None)
         temperatures.extend(values.dropna().tolist())
-        if sparse:
-            # 只标实际采样点。虚线连接这些点，不往明细表补造 SMART 数据。
-            ax.scatter(seconds, values, color=color, s=60, zorder=5)
-            for i in range(len(data)):
-                if pd.isna(values.iloc[i]):
-                    continue
-                ax.text(seconds.iloc[i], values.iloc[i] + offset, f'{values.iloc[i]:.0f}',
-                        fontsize=10, color=color, ha='center', va='center')
     # 公司低功耗原图不显示空的带宽轴；读写测试仍保留该轴，缺数据不会假画成零。
     right = ax.twinx() if bandwidth_data or mode in ('read_1m', 'write_1m') else None
     for seconds,values in bandwidth_data:
@@ -2601,13 +2680,12 @@ def create_company_temperature_figure(frames, title, start=None, mode=None):
     bw_high = max(10000, math.ceil(max(bandwidth, default=0)/1000)*1000)
     ax.set_ylim(low, high)
     ax.yaxis.set_major_locator(MultipleLocator(10))
-    ax.set_ylabel('温度 (℃)', fontsize=14)
+    ax.set_ylabel('温度（℃）', fontsize=14)
     if right is not None:
         right.set_ylim(0, bw_high)
         right.yaxis.set_major_locator(MultipleLocator(1000 if bw_high <= 15000 else 2000))
         right.set_ylabel('带宽 (MiB/s)', fontsize=14)
-    if mode != 'l0_ps4':
-        ax.set_xlabel('时间(秒)', fontsize=14, labelpad=10)
+    ax.set_xlabel('时间（秒）', fontsize=14, labelpad=10)
     ax.grid(alpha=.2)
     (right if right is not None else ax).set_title(title, fontsize=16, pad=20)
     lines, labels = ax.get_legend_handles_labels()
@@ -2624,7 +2702,7 @@ def save_company_temperature_chart(frames, destination, title, subtitle='', star
     import matplotlib.pyplot as plt
     fig = create_company_temperature_figure(frames, title, start=start, mode=mode)
     try:
-        fig.savefig(destination, dpi=300, bbox_inches='tight')
+        fig.savefig(destination, dpi=300)
     finally:
         plt.close(fig)
 

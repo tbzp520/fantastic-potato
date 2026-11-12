@@ -29,6 +29,12 @@ def short_configuration(cfg):
     for mode in app.ORDER:
         result['tests'][mode]['duration_s'] = SHORT_SECONDS[mode]
         result['tests'][mode]['wait_before_s'] = 0
+        # 新版正式窗口为600秒。可选短测只验证5秒真实采集，不冒充完整选点报告。
+        item = result['tests'][mode]
+        if 'window_s' in item:
+            item.pop('window_s')
+            item['plot_interval_s'] = item['interval_s']
+            item['points'] = min(item['points'], max(2, int(item['duration_s']/item['interval_s'])-1))
     return result
 
 
@@ -59,27 +65,55 @@ def prepare_configuration(cfg, role):
     from serial.tools import list_ports
     cfg = copy.deepcopy(cfg)
     issues = []
+    checks = {}
     def attempt(label, operation):
         try:
-            operation()
+            record = operation()
+            if record is not None:
+                checks[label] = record
         except Exception as exc:
             issues.append(label+'：'+str(exc))
+            checks[label] = {'passed':False, 'error':str(exc)}
     def port():
         cfg['serial'][role+'_port'] = automatic_port(cfg,role,list(list_ports.comports()))
     attempt('USB互连线',port)
     if role == 'host':
+        def platform():
+            record = app.refresh_test_platform(cfg)
+            report = cfg['report']
+            print('当前测试电脑：'+str(report.get('platform') or '')+'；CPU：'+str(report.get('cpu') or '')+
+                  '；系统：'+str(report.get('os') or '')+'；BIOS：'+str(record.get('bios') or ''), flush=True)
+            return record
+        attempt('电脑平台身份',platform)
         local = cfg['local_video']
         local['adapter'] = 'windows_media_player'
         local['ui'].update(backend='uia',window={'title_re':'.*媒体播放器.*','class_name':'ApplicationFrameWindow'},
             position_control={'auto_id':'TimeElapsedElement','control_type':'Text'})
         cfg['online_video']['adapter'] = 'bilibili_1080'
+        cfg['online_video']['browser_control'] = 'native_edge'
+        def video():
+            from portable_tools import rebind_local_video
+            record = rebind_local_video(local)
+            if record.get('rebound'):
+                print('已按原文件名重新绑定本地视频：'+local['file'], flush=True)
+            return record
+        attempt('本地视频',video)
         def bit():
             from 接入并验证BIT import confirmed_bit_configuration
+            from portable_tools import rebind_bit_executable
+            candidate = copy.deepcopy(cfg)
+            located = rebind_bit_executable(candidate['burnintest'], app.bit_program_version)
             old_proof = cfg['burnintest'].get('script_verification')
-            updated = confirmed_bit_configuration(cfg)
+            updated = confirmed_bit_configuration(candidate)
             cfg['burnintest'] = updated['burnintest']
-            if old_proof:
+            # 保留确切相同软件/配置的原证据；换机找到软件不等同实际短测通过。
+            if (old_proof and not located.get('rebound') and old_proof.get('executable_sha256') ==
+                    app.sha256(cfg['burnintest']['executable']) and old_proof.get('configuration_sha256') ==
+                    cfg['burnintest'].get('configuration_sha256')):
                 cfg['burnintest']['script_verification'] = old_proof
+            if located.get('rebound'):
+                print('已定位本机已安装BIT 9.0 build1003：'+cfg['burnintest']['executable'], flush=True)
+            return located
         attempt('BIT配置',bit)
         def hwinfo():
             hw = cfg['hwinfo']
@@ -122,10 +156,8 @@ def prepare_configuration(cfg, role):
             if wanted.strip('{}').lower() != selected['InterfaceGuid'].strip('{}').lower():
                 print('已重新绑定在线视频网卡：'+selected.get('Name',selected['InterfaceGuid']),flush=True)
         attempt('在线视频网卡',network)
-        if not Path(local['file']).is_file():
-            issues.append('本地视频：未找到 '+local['file'])
     else:
-        # 首次使用提供公网示例；已经填写的 NTP 地址原样保留。
+        # 公开示例只补空NTP；保留使用者已填写的服务器，不替换为固定内网。
         clock=cfg.setdefault('clock_sync',{})
         servers=clock.get('ntp_servers',[])
         if not servers:
@@ -151,7 +183,7 @@ def prepare_configuration(cfg, role):
             finally:
                 probe.close()
         attempt('JK808实读',thermometer)
-    app.save_setup_config(cfg,'集中接入_'+role,{'issues':issues,'version':app.VERSION})
+    app.save_setup_config(cfg,'集中接入_'+role,{'issues':issues,'version':app.VERSION,'checks':checks})
     return cfg,issues
 
 
@@ -488,7 +520,7 @@ def main():
             app.run_host(cfg)
             return
         while True:
-            print('\nA. 可选联调检查（四项短测）\nB. 自动识别盘片并正式测试（无需先跑A）\nC. 补取上次结果\nD. 继续上次未完成测试（保留已完成项）\n0. 退出')
+            print('\nA. 可选联调检查（四项短测）\nB. 自动识别盘片并正式测试（无需先跑A）\nC. 补取上次结果\nD. 继续上次未完成测试（保留已完成项）\nE. 生成/更新本批次统一结果（不重跑测试）\n0. 退出')
             action = input('选择：').strip().upper()
             if action=='0':return
             try:
@@ -504,6 +536,9 @@ def main():
                     if modes: app.run_receiver(cfg,modes)
                 elif action=='C': app.recover_result(cfg,input('上次结果文件夹路径：').strip().strip('"'))
                 elif action=='D': app.resume_failed_flow(cfg,input('原结果文件夹路径（回车使用最近正式任务）：').strip().strip('"'))
+                elif action=='E':
+                    path=input('项目/批次结果目录（回车使用当前配置目录）：').strip().strip('"')
+                    app.rebuild_selected_batch(cfg,path or None)
             except Exception as exc:
                 print('未完成：'+str(exc))
 

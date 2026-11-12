@@ -25,6 +25,28 @@ def write_csv(path, rows, columns):
         writer.writerows(rows)
 
 
+def sync_surface_source(source, destination):
+    """原始全程文件为准，原子更新派生stage副本，修复中断留下的半文件。"""
+    import filecmp
+    import os
+    import shutil
+    import tempfile
+    source, destination = Path(source), Path(destination)
+    if not source.is_file() or source.resolve() == destination.resolve():
+        return
+    if destination.is_file() and filecmp.cmp(source, destination, shallow=False):
+        return
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix='.jk808-copy-', suffix='.tmp', dir=destination.parent, delete=False) as stream:
+            temporary = Path(stream.name)
+        shutil.copyfile(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def finite(value):
     return isinstance(value, (float, int)) and not isinstance(value, bool) and math.isfinite(value)
 
@@ -94,11 +116,27 @@ def read_hwinfo(path, settings):
     return records, errors
 
 
+def validate_sampling_geometry(raw_interval, plot_interval, count, window_s=None):
+    if (not finite(raw_interval) or not finite(plot_interval) or raw_interval <= 0 or plot_interval <= 0
+            or type(count) is not int or count < 2):
+        raise ValueError('采集间隔、绘图间隔或点数无效')
+    ratio = plot_interval/raw_interval
+    stride = round(ratio)
+    if stride < 1 or abs(ratio-stride) > 1e-8:
+        raise ValueError('绘图间隔必须是原始采集间隔的整数倍')
+    if window_s is not None and (not finite(window_s) or abs(window_s-count*plot_interval) > 1e-6):
+        raise ValueError('完整窗口时长必须等于绘图点数×绘图间隔')
+    return stride
+
+
 def align_and_select(smart, surface, start_epoch, end_epoch, interval, count,
-                     time_tolerance=2.0, surface_tolerance=.75, required_smart=('Composite',)):
+                     time_tolerance=2.0, surface_tolerance=.75, required_smart=('Composite',),
+                     *, sample_interval=None, window_s=None):
     """连续指连续采样时刻，不是把缺失行删掉之后的连续下标。"""
     if end_epoch <= start_epoch or interval <= 0 or count < 2:
         raise ValueError('测试时间、采样间隔或点数无效')
+    raw_interval = interval if sample_interval is None else sample_interval
+    stride = validate_sampling_geometry(raw_interval, interval, count, window_s)
     smart = [dict(row) for row in smart if start_epoch <= row['epoch'] < end_epoch]
     surface = sorted((row for row in surface if start_epoch <= row['epoch'] < end_epoch), key=lambda r: r['epoch'])
     times = [r['epoch'] for r in surface]
@@ -106,7 +144,7 @@ def align_and_select(smart, surface, start_epoch, end_epoch, interval, count,
     if not smart:
         return [], [], [{'source': 'HWiNFO', 'epoch': start_epoch, 'reason': '正式区间没有采样'}]
     anchor = smart[0]['epoch']
-    if anchor - start_epoch > interval + time_tolerance:
+    if anchor - start_epoch > raw_interval + time_tolerance:
         errors.append({'source': 'HWiNFO', 'epoch': start_epoch, 'reason': '首个采样到达过晚'})
     previous = None
     used_surface = set()
@@ -114,11 +152,11 @@ def align_and_select(smart, surface, start_epoch, end_epoch, interval, count,
         stamp = record['epoch']
         if previous is not None:
             gap = stamp - previous
-            if gap > interval + time_tolerance:
-                missing = previous + interval
+            if gap > raw_interval + time_tolerance:
+                missing = previous + raw_interval
                 while missing < stamp - time_tolerance:
                     errors.append({'source': 'HWiNFO', 'epoch': missing, 'reason': '预期采样缺失'})
-                    missing += interval
+                    missing += raw_interval
         previous = stamp
         pos = bisect.bisect_left(times, stamp)
         candidates = [j for j in (pos-1, pos) if 0 <= j < len(times)]
@@ -136,15 +174,26 @@ def align_and_select(smart, surface, start_epoch, end_epoch, interval, count,
             errors.append({'source': '对齐', 'epoch': stamp, 'reason': '必需温度缺失或JK808未在容差内对齐'})
         aligned.append(row)
     # 末端没有SMART时，按其实际采样相位列出遗漏的预期时刻。
-    expected = smart[-1]['epoch'] + interval
+    expected = smart[-1]['epoch'] + raw_interval
     while expected < end_epoch - time_tolerance:
         errors.append({'source': 'HWiNFO', 'epoch': expected, 'reason': '末端预期采样缺失'})
-        expected += interval
+        expected += raw_interval
     best, best_score = [], None
-    for left in range(len(aligned)-count+1):
-        window = aligned[left:left+count]
-        if not all(r['valid'] for r in window):
+    # 新规则按半开区间[start,start+600)审查全部5秒原始点，包括最后绘图点之后的原始记录。
+    # 历史文件没有window_s时，保留原来的连续count点规则。
+    raw_count = count*stride if window_s is not None else (count-1)*stride+1
+    for left in range(len(aligned)-raw_count+1):
+        raw_window = aligned[left:left+raw_count]
+        if window_s is not None and raw_window[0]['epoch']+window_s > end_epoch+1e-6:
             continue
+        if not all(r['valid'] for r in raw_window):
+            continue
+        if any(abs((b['epoch']-a['epoch'])-raw_interval) > time_tolerance for a, b in zip(raw_window, raw_window[1:])):
+            continue
+        if window_s is not None and any(abs(r['epoch']-raw_window[0]['epoch']-i*raw_interval) > time_tolerance
+                                        for i,r in enumerate(raw_window)):
+            continue  # 防止每次小幅延迟累计成超过十分钟的120点。
+        window = raw_window[::stride][:count]
         if any(abs((b['epoch']-a['epoch'])-interval) > time_tolerance for a, b in zip(window, window[1:])):
             continue
         values = [r['Composite'] for r in window]
@@ -199,7 +248,7 @@ def calculate_statistics(selected):
 
 
 def create_selected_points_figure(selected, title):
-    """沿用 Linux 图的配色、尺寸及 SMART 标注；只使用已选中的连续点。"""
+    """统一六路实线图；直接绘制真实选中值，不平滑、不插值。"""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -209,44 +258,26 @@ def create_selected_points_figure(selected, title):
     plt.rcParams['axes.unicode_minus'] = False
     if not selected:
         raise ValueError('没有选中点，不能绘图')
-    # offset 是文字与采样点的纵向距离，不改变真实曲线数值。
-    styles = [('CPU_Surface','#D83A56','CPU表面',0),('NAND_Surface','#FF7F50','NAND表面',0),
-              ('AMB','#457B9D','环境AMB',0),('Composite','#7209B7','复合温度',8),
-              ('CPU','#9C6615','CPU',-8),('NAND','#2D9596','NAND',-16)]
+    styles = [('CPU_Surface','#FF0000','CPU表面'),('NAND_Surface','#4A91FA','NAND表面'),
+              ('AMB','#228B22','环境温度'),('Composite','#7209B7','复合温度'),
+              ('CPU','#FF0000','CPU'),('NAND','#4A91FA','NAND')]
     seconds = [r['plot_second'] for r in selected]
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
     extents = [0, 110]
-    label_heights = [[] for _ in selected]
-    for name, color, label, offset in styles:
+    for name, color, label in styles:
         values = [r[name] if finite(r.get(name)) else math.nan for r in selected]
         if not any(finite(v) for v in values):
             continue
         smart = name in ('Composite','CPU','NAND')
         ax.plot(seconds, values, color=color, label=label,
-                linewidth=1.5 if smart else 2, linestyle='--' if smart else '-', alpha=.8 if smart else 1)
+                linewidth=1.7 if smart else .9, linestyle='-', marker=None, alpha=1)
         extents.extend(v for v in values if finite(v))
-        if smart:
-            ax.scatter(seconds, values, color=color, s=60, zorder=5)
-            for index, (second, value) in enumerate(zip(seconds, values)):
-                if finite(value):
-                    # 温度相近时，固定偏移可能碰到另一条曲线，稍移文字而不移动采样点。
-                    occupied = [selected[index][key] for key in TEMPERATURES if finite(selected[index].get(key))]
-                    occupied += label_heights[index]
-                    height = value+offset
-                    direction = 1 if offset > 0 else -1
-                    while any(abs(height-other) < 3 for other in occupied):
-                        height += direction*3
-                    label_heights[index].append(height)
-                    ax.text(second, height, f'{value:.0f}', fontsize=10, color=color,
-                            ha='center', va='center', zorder=8,
-                            bbox=dict(facecolor='white', edgecolor='none', pad=.2, alpha=.85))
-                    extents.extend((height-3, height+3))
     ax.set_ylim(math.floor(min(extents)/10)*10, math.ceil(max(extents)/10)*10)
     ax.yaxis.set_major_locator(MultipleLocator(10))
-    # 留白只让首末圆点和数字完整可见，曲线仍到最后一个真实选中点为止。
+    # 保留少量留白，曲线严格止于最后真实选中点。
     ax.margins(x=.035)
-    ax.set_xlabel('时间(秒)', fontsize=14, labelpad=10)
-    ax.set_ylabel('温度 (℃)', fontsize=14)
+    ax.set_xlabel('时间（秒）', fontsize=14, labelpad=10)
+    ax.set_ylabel('温度（℃）', fontsize=14)
     ax.set_title(title, fontsize=16, pad=20)
     ax.grid(alpha=.2)
     ax.legend(loc='upper center', bbox_to_anchor=(.5,-.12), ncol=6, fontsize=11)
@@ -258,9 +289,199 @@ def draw_selected_points(selected, path, title):
     import matplotlib.pyplot as plt
     fig = create_selected_points_figure(selected, title)
     try:
-        fig.savefig(path, dpi=300, bbox_inches='tight')
+        fig.savefig(path, dpi=300)
     finally:
         plt.close(fig)
+
+
+def write_readable_raw_data(folder, conditions=None, aligned=(), selected=()):
+    """只新增查看副本；全量来自原文件，正式段和选中点只是标记。"""
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    conditions = conditions or {}
+    settings = conditions.get('hwinfo', {})
+    # 启动失败可能尚未产生conditions；配置快照仍可提供原列映射。
+    if not settings:
+        try:
+            settings = json.loads((folder.parent/'config_snapshot.json').read_text('utf-8-sig'))['hwinfo']
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    start, end = conditions.get('start_epoch'), conditions.get('end_epoch')
+    has_period = finite(start) and finite(end) and end > start
+    selected_smart = {r.get('source_row') for r in selected}
+    selected_surface = {r.get('surface_row') for r in selected}
+    aligned_surface = {r.get('surface_row') for r in aligned}
+    issues, smart_rows, surface_rows, raw_headers = [], [], [], []
+
+    def when(stamp):
+        try:
+            return datetime.fromtimestamp(stamp, BEIJING).isoformat(timespec='milliseconds') if finite(stamp) else ''
+        except (OSError, OverflowError, ValueError):
+            return ''
+
+    def phase(stamp):
+        if not has_period or not finite(stamp):
+            return '正式时段未知'
+        return '测试前' if stamp < start else ('正式段' if stamp < end else '测试后')
+
+    def issue(source, line, reason, raw=''):
+        issues.append({'来源':source, '原始行号':line, '问题':reason, '原始内容':raw})
+
+    smart_path = folder/'hwinfo.csv'
+    if smart_path.is_file():
+        try:
+            with smart_path.open(encoding=settings.get('encoding', 'utf-8-sig'), newline='') as stream:
+                reader = csv.reader(stream, delimiter=settings.get('delimiter', ','), strict=True)
+                header = next(reader)
+                raw_headers = [f'原始列{i+1}：{name}' for i, name in enumerate(header)]
+                di = column_index(header, settings.get('date_column', 'Date'))
+                ti = column_index(header, settings.get('time_column', 'Time'))
+                columns = {}
+                for key in ('Composite', 'CPU', 'NAND'):
+                    try:
+                        columns[key] = column_index(header, settings.get('columns', {}).get(key))
+                    except (ValueError, TypeError) as exc:
+                        issue('HWiNFO', 1, f'{key}列映射缺失：{exc}')
+                skipped_headers, skipped_groups = 0, 0
+                for number, values in enumerate(reader, 2):
+                    if not values:
+                        continue
+                    if values == header:
+                        skipped_headers += 1
+                        continue
+                    if (len(values) > max(di, ti) and not values[di].strip() and not values[ti].strip()
+                            and any(value.strip().startswith('S.M.A.R.T.:') for value in values)):
+                        skipped_groups += 1
+                        continue
+                    try:
+                        stamp = datetime.strptime(values[di].strip()+' '+values[ti].strip(),
+                            settings.get('datetime_format', '%d.%m.%Y %H:%M:%S.%f')).replace(tzinfo=BEIJING).timestamp()
+                    except (ValueError, IndexError) as exc:
+                        issue('HWiNFO', number, '时间无法解析，未冒充测温行：'+str(exc), json.dumps(values, ensure_ascii=False))
+                        continue
+                    row = {'原始行号':number, '北京时间':when(stamp), 'Unix时间戳':stamp,
+                           '时段':phase(stamp), '选中绘图统计点':'是' if number in selected_smart else '否'}
+                    missing = []
+                    for metric, label in (('Composite','Drive Temperature（Composite复合温度）'),
+                            ('CPU','Drive Temperature 2（CPU/SSD主控）'), ('NAND','Drive Temperature 3（NAND闪存）')):
+                        index = columns.get(metric)
+                        value = values[index] if index is not None and index < len(values) else ''
+                        row[label] = value
+                        try:
+                            number_value = float(value.strip().replace(settings.get('decimal_mark', '.'), '.'))
+                            valid = math.isfinite(number_value) and -100 <= number_value <= 200
+                        except (ValueError, TypeError):
+                            valid = False
+                        if not valid:
+                            missing.append(metric)
+                    if len(values) != len(header):
+                        missing.append('字段数不符')
+                    row['数据状态'] = '缺失或无效：'+','.join(missing) if missing else '原始记录'
+                    row.update({name:values[i] if i < len(values) else '' for i, name in enumerate(raw_headers)})
+                    if len(values) > len(header):
+                        row['额外原始字段'] = json.dumps(values[len(header):], ensure_ascii=False)
+                    smart_rows.append(row)
+        except (OSError, UnicodeError, ValueError, csv.Error, StopIteration) as exc:
+            issue('HWiNFO', '', '无法完整读取原始文件：'+str(exc))
+    else:
+        issue('HWiNFO', '', '缺少hwinfo.csv，不能补造SMART原始记录')
+
+    surface_path = folder/'jk808.jsonl'
+    if surface_path.is_file():
+        try:
+            surface_lines = surface_path.read_text('utf-8-sig').splitlines()
+        except (OSError, UnicodeError) as exc:
+            issue('JK808', '', '无法完整读取原始文件：'+str(exc))
+            surface_lines = []
+        for number, line in enumerate(surface_lines, 1):
+            if not line.strip():
+                continue
+            try:
+                raw = json.loads(line)
+                if not isinstance(raw, dict):
+                    raise ValueError('记录不是对象')
+                stamp = raw.get('epoch')
+                source_row = raw.get('source_row', number)
+                missing = [name for name in SURFACE if not finite(raw.get(name))]
+                if not finite(stamp):
+                    missing.append('时间')
+                row = {'原始行号':number, '采集记录行号':source_row, '北京时间':when(stamp), 'Unix时间戳':stamp,
+                       '时段':phase(stamp), '秒槽':raw.get('slot', ''),
+                       'CPU表面温度（℃）':raw.get('CPU_Surface'), 'NAND表面温度（℃）':raw.get('NAND_Surface'),
+                       '环境AMB温度（℃）':raw.get('AMB'),
+                       '对齐基础点':'是' if source_row in aligned_surface else '否',
+                       '选中绘图统计点':'是' if source_row in selected_surface else '否',
+                       '数据状态':str(raw.get('error') or ('缺失或无效：'+','.join(missing) if missing else '原始记录')),
+                       '全部原始字段（JSON）':line}
+                if missing or raw.get('error'):
+                    issue('JK808', number, row['数据状态'], line)
+                surface_rows.append(row)
+            except (ValueError, TypeError) as exc:
+                issue('JK808', number, '原始行无法解析：'+str(exc), line)
+                surface_rows.append({'原始行号':number, '时段':'正式时段未知', '数据状态':'原始行无法解析',
+                                     '全部原始字段（JSON）':line})
+    else:
+        issue('JK808', '', '缺少jk808.jsonl，不能补造秒级记录')
+    if not has_period:
+        issue('正式时段', '', '没有有效的开始/结束时间，不能判定正式段或补造选中点')
+    smart_times = [row['Unix时间戳'] for row in smart_rows]
+    bounds = smart_times + ([start, end] if has_period else [])
+    lower, upper = (min(bounds), max(bounds)) if bounds else (None, None)
+    item_surface = [row for row in surface_rows if finite(row.get('Unix时间戳')) and lower is not None
+                    and lower <= row['Unix时间戳'] <= upper]
+    for row in surface_rows:
+        row['本项原始时间范围'] = '是' if finite(row.get('Unix时间戳')) and lower is not None and lower <= row['Unix时间戳'] <= upper else '否'
+    smart_columns = ['原始行号','北京时间','Unix时间戳','时段','选中绘图统计点',
+                     'Drive Temperature（Composite复合温度）','Drive Temperature 2（CPU/SSD主控）',
+                     'Drive Temperature 3（NAND闪存）','数据状态',*raw_headers,'额外原始字段']
+    surface_columns = ['原始行号','采集记录行号','北京时间','Unix时间戳','时段','本项原始时间范围','秒槽',
+                       'CPU表面温度（℃）','NAND表面温度（℃）','环境AMB温度（℃）','对齐基础点',
+                       '选中绘图统计点','数据状态','全部原始字段（JSON）']
+    filenames = ['HWiNFO_SMART全部原始记录_中文.csv','JK808全程原始记录_中文.csv',
+                 'JK808本项秒级原始记录_中文.csv','原始数据异常行_中文.csv']
+    for name, rows, cols in ((filenames[0], smart_rows, smart_columns),
+            (filenames[1], surface_rows, surface_columns), (filenames[2], item_surface, surface_columns),
+            (filenames[3], issues, ['来源','原始行号','问题','原始内容'])):
+        write_csv(folder/name, rows, cols)
+    summary = {'SMART全部原始记录':len(smart_rows), 'SMART正式段记录':sum(r['时段']=='正式段' for r in smart_rows),
+               'SMART选中点':sum(r['选中绘图统计点']=='是' for r in smart_rows),
+               'JK808全程原始记录':len(surface_rows), 'JK808本项原始记录':len(item_surface),
+               'JK808正式段记录':sum(r['时段']=='正式段' for r in surface_rows),
+               'JK808选中点':sum(r.get('选中绘图统计点')=='是' for r in surface_rows),
+               '本项原始范围开始':when(lower), '本项原始范围结束':when(upper),
+               '正式开始':when(start), '正式结束（不含）':when(end),
+               '原始文件':{'SMART':'hwinfo.csv', 'JK808':'jk808.jsonl'},
+               '说明':'SMART全量含正式段前后原始测温行；JK808全程CSV覆盖源jsonl，本项CSV按正式段及本项SMART首尾扩展。CPU指SSD主控，不是电脑CPU。原始文件不改动，缺失不补造。',
+               '问题':issues}
+    (folder/'原始数据说明.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), 'utf-8')
+
+    def table(rows, columns):
+        body = '<div class="scroll"><table><thead><tr>'+''.join('<th>'+escape(col)+'</th>' for col in columns)+'</tr></thead><tbody>'
+        for row in rows:
+            body += '<tr data-phase="'+escape(row.get('时段',''))+'" data-selected="'+escape(row.get('选中绘图统计点','否'))+'">'
+            body += ''.join('<td>'+escape('' if row.get(col) is None else str(row.get(col,'')))+'</td>' for col in columns)+'</tr>'
+        return body+'</tbody></table></div>'
+
+    def controls():
+        return '<p><label>显示：<select onchange="filterRows(this)"><option value="all">全部原始记录</option><option value="formal">正式段</option><option value="selected">选中绘图统计点</option></select></label></p>'
+
+    html = '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>SMART与JK808原始数据</title>'
+    html += '<style>body{font:16px/1.6 "Microsoft YaHei",sans-serif;margin:24px;color:#193047}table{border-collapse:collapse;white-space:nowrap}td,th{border:1px solid #ccd6de;padding:6px 10px}th{position:sticky;top:0;background:#eaf0f5}.scroll{overflow:auto;max-height:600px}a{margin-right:20px}select{font:inherit}</style>'
+    html += '<h1>SMART与JK808原始数据</h1><p>'+escape(summary['说明'])+'</p>'
+    html += '<p>正式段：'+escape(when(start) or '未知')+' 至 '+escape(when(end) or '未知')+'（结束时刻不含）。选中点用于图表统计，不代表全部原始记录。</p>'
+    html += '<p>'+''.join('<a href="'+escape(name)+'">'+escape(name)+'</a>' for name in filenames)+'</p>'
+    html += '<section><h2>HWiNFO SMART：全部 '+str(len(smart_rows))+' 条 / 正式段 '+str(summary['SMART正式段记录'])+' 条 / 选中 '+str(summary['SMART选中点'])+' 点</h2>'
+    html += '<p>Drive Temperature → Composite复合温度；Drive Temperature 2 → CPU/SSD主控；Drive Temperature 3 → NAND闪存。下列温度直接显示CSV原值，所有原始列均保留在中文CSV中。末尾重复表头和设备分组不计测温行。</p>'
+    html += controls()+table(smart_rows, smart_columns[:9])+'</section>'
+    html += '<section><h2>JK808本项秒级记录：'+str(len(item_surface))+' 条 / 正式段 '+str(summary['JK808正式段记录'])+' 条 / 选中 '+str(summary['JK808选中点'])+' 点</h2>'
+    html += '<p>本项查看范围：'+escape(when(lower) or '未知')+' 至 '+escape(when(upper) or '未知')+'；按正式时段和该项SMART首尾原始测温时间扩展。下方全程源数据可能同时包含其他测试项。</p>'
+    shown = ['原始行号','北京时间','时段','CPU表面温度（℃）','NAND表面温度（℃）','环境AMB温度（℃）','对齐基础点','选中绘图统计点','数据状态']
+    html += controls()+table(item_surface, shown)+'</section>'
+    html += '<details><summary>展开JK808全程原始记录（源jsonl全部 '+str(len(surface_rows))+' 条，含本项之外记录）</summary><section>'+controls()+table(surface_rows, shown)+'</section></details>'
+    html += '<h2>缺失及读取问题</h2>'+(table(issues, ['来源','原始行号','问题']) if issues else '<p>未发现原始读取问题；采样缺失和对齐异常另见缺失及异常明细.csv。</p>')
+    html += '<script>function filterRows(select){const scope=select.closest("section");scope.querySelectorAll("tbody tr").forEach(row=>{row.hidden=select.value==="formal"?row.dataset.phase!=="正式段":select.value==="selected"?row.dataset.selected!=="是":false})}</script></html>'
+    (folder/'原始数据查看.html').write_text(html, 'utf-8')
+    return summary
 
 
 def build_stage_report(folder):
@@ -268,11 +489,17 @@ def build_stage_report(folder):
     folder = Path(folder)
     conditions = json.loads((folder/'conditions.json').read_text(encoding='utf-8'))
     smart, errors = read_hwinfo(folder/'hwinfo.csv', conditions['hwinfo'])
-    surface = [json.loads(line) for line in (folder/'jk808.jsonl').read_text(encoding='utf-8').splitlines() if line.strip()]
+    surface = []
+    for number, line in enumerate((folder/'jk808.jsonl').read_text(encoding='utf-8-sig').splitlines(), 1):
+        if line.strip():
+            row = json.loads(line)
+            row.setdefault('source_row', number)  # 旧日志无source_row时仍追溯源JSONL行号。
+            surface.append(row)
     aligned, selected, missing = align_and_select(smart, surface, conditions['start_epoch'],
-        conditions['end_epoch'], conditions['interval_s'], conditions['points'],
+        conditions['end_epoch'], conditions.get('plot_interval_s',conditions['interval_s']), conditions['points'],
         conditions.get('time_tolerance_s',2), conditions.get('surface_tolerance_s',.75),
-        conditions['hwinfo'].get('required_metrics',['Composite']))
+        conditions['hwinfo'].get('required_metrics',['Composite']),
+        sample_interval=conditions['interval_s'], window_s=conditions.get('window_s'))
     errors += missing + check_surface_gaps(surface, conditions['start_epoch'], conditions['end_epoch'])
     notices = []
     events_path=folder/'events.jsonl'
@@ -296,13 +523,26 @@ def build_stage_report(folder):
     write_csv(folder/'选中绘图及统计点.csv', selected, columns)
     write_csv(folder/'缺失及异常明细.csv', errors, ['source','source_row','epoch','time_beijing','reason'])
     write_csv(folder/'播放提示明细.csv', notices, ['source','epoch','time_beijing','reason'])
+    try:
+        raw_data = write_readable_raw_data(folder, conditions, aligned, selected)
+        raw_data_error = None
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        # 查看副本失败不改变原始选点和负载状态，避免续测错误地重跑已完成负载。
+        raw_data = {}
+        raw_data_error = str(exc)
     statistics = calculate_statistics(selected)
     result = {'selected_count':len(selected), 'required_count':conditions['points'],
               'statistics':statistics, 'data_issue_count':len(errors), 'playback_notice_count':len(notices),
               'status':'有效选点（有全程异常）' if selected and errors else ('有效选点' if selected else '数据不足'),
               'selection':'Composite极差最小的连续窗口；同分取最早窗口',
+              'sample_interval_s':conditions['interval_s'],
+              'plot_interval_s':conditions.get('plot_interval_s',conditions['interval_s']),
+              'window_s':conditions.get('window_s'),
               'workload_status':workload_status,'workload_ok':workload_ok,
+              'raw_data':{key:value for key,value in raw_data.items() if key != '问题'},
               'simulated':conditions.get('simulated',False)}
+    if raw_data_error:
+        result['raw_data_error'] = raw_data_error
     if not workload_ok:
         result['status']='负载异常，统计仅供复核' if selected else '负载异常且数据不足'
     (folder/'statistics.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
@@ -310,7 +550,7 @@ def build_stage_report(folder):
 
 
 def artifact_stem(label, capacity='', simulated=False):
-    if capacity and capacity not in ('512G', '1T', '2T'):
+    if capacity and capacity not in ('128G', '256G', '512G', '1T', '2T'):
         raise ValueError('报告容量无效，不能用上一张盘的容量命名')
     return label+('_'+capacity if capacity else '')+('_模拟数据' if simulated else '')
 
@@ -326,16 +566,55 @@ def clear_generated_stage_report(folder, output, mode, simulated=False, capacity
     return title
 
 
-def write_stage_failure(folder, output, mode, error, simulated=False, capacity=''):
+def write_stage_failure(folder, output, mode, error, simulated=False, capacity='', *, status='报告生成失败'):
     title = clear_generated_stage_report(folder,output,mode,simulated,capacity)
-    result = {'status':'报告生成失败','error':str(error),'selected_count':0,
+    result = {'status':status,'error':str(error),'selected_count':0,
               'statistics':{},'data_issue_count':1,'workload_ok':False,'simulated':simulated}
     Path(folder).mkdir(parents=True,exist_ok=True)
     Path(output).mkdir(parents=True,exist_ok=True)
+    try:
+        conditions_path = Path(folder)/'conditions.json'
+        conditions = json.loads(conditions_path.read_text('utf-8-sig')) if conditions_path.is_file() else {}
+        raw_data = write_readable_raw_data(folder, conditions)
+        result['raw_data'] = {key:value for key,value in raw_data.items() if key != '问题'}
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        result['raw_data_error'] = str(exc)
     (Path(folder)/'statistics.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),'utf-8')
+    explanation = ('报告生成失败，本项旧图和统计已作废。' if status=='报告生成失败'
+                   else status+'；本项没有可用于统计的正式测试数据。')
+    from os.path import relpath
+    raw_link = Path(relpath(Path(folder)/'原始数据查看.html', output)).as_posix()
     (Path(output)/(title+'.html')).write_text('<!doctype html><meta charset="utf-8"><h1>'+escape(title)+
-        '</h1><p>报告生成失败，本项旧图和统计已作废。</p><pre>'+escape(str(error))+'</pre>',encoding='utf-8')
+        '</h1><p>'+escape(explanation)+'</p><pre>'+escape(str(error))+'</pre><p><a href="'+
+        escape(raw_link)+'">查看SMART与JK808原始数据（含缺失说明）</a></p>',encoding='utf-8')
     return result
+
+
+def unstarted_stage_reason(folder, mode):
+    """只有明确的中断记录能证明未执行；不能把已运行后的数据丢失伪装成未执行。"""
+    folder=Path(folder)
+    if (folder/'conditions.json').exists():return None
+    failure_path=folder/'stage_failure.json'
+    if failure_path.is_file():
+        try:
+            failure=json.loads(failure_path.read_text('utf-8-sig'))
+            if failure.get('mode')==mode and failure.get('formal_started') is False:
+                return '启动失败',failure.get('error') or '在正式计时前中断，请查看启动失败记录。'
+        except (OSError,ValueError,TypeError):pass
+    # 兼容已回传的旧版失败任务，不要求补造条件文件或温度采样。
+    try:
+        task=json.loads((folder.parent/'task.json').read_text('utf-8-sig'))
+        status=json.loads((folder.parent/'status.json').read_text('utf-8-sig'))
+        modes=task['modes'];active=status.get('mode')
+        if (task.get('finished') is not True or status.get('phase')!='未完成'
+                or status.get('job_id')!=task.get('job_id') or not isinstance(modes,list)
+                or active not in modes or mode not in modes):return None
+        if mode==active and 'start_epoch' not in status:
+            return '启动失败',status.get('message') or '在正式计时前中断。'
+        if modes.index(mode)>modes.index(active):
+            return '未执行','前一项目 '+LABELS.get(active,active)+' 中断，本项尚未执行；可继续未完成的测试。'
+    except (OSError,ValueError,TypeError,KeyError):pass
+    return None
 
 
 def export_stage(folder, output, mode=None, simulated=False, capacity=''):
@@ -344,6 +623,11 @@ def export_stage(folder, output, mode=None, simulated=False, capacity=''):
     if mode is None:
         mode = folder.name if folder.name in LABELS else json.loads((folder/'conditions.json').read_text('utf-8'))['mode']
     try:
+        unstarted=unstarted_stage_reason(folder,mode)
+        if unstarted:
+            state,reason=unstarted
+            result=write_stage_failure(folder,output,mode,reason,simulated,capacity,status=state)
+            return result,None
         conditions = json.loads((folder/'conditions.json').read_text('utf-8'))
         simulated = conditions.get('simulated',simulated)
         if conditions['mode']!=mode:
@@ -375,6 +659,13 @@ def export_valid_stage(folder, output, capacity=''):
             body += '<tr><td>'+name+'</td>'+''.join(f'<td>{value[k]:.3f}</td>' for k in ('max','mean','min'))+'</tr>'
         body += '</table>'
     body += '<p>按所选连续点统计，原始数据、选点表和缺失时间明细在手工复测文件夹。</p>'
+    from os.path import relpath
+    raw_link = Path(relpath(folder/'原始数据查看.html', output)).as_posix()
+    raw = result.get('raw_data', {})
+    if raw:
+        body += '<p><a href="'+escape(raw_link)+'">查看SMART三路与JK808每秒原始记录</a>：SMART全量 '+str(raw['SMART全部原始记录'])+' 条，正式段 '+str(raw['SMART正式段记录'])+' 条，选中 '+str(raw['SMART选中点'])+' 点；全部原始记录与选中点分别列出。</p>'
+    elif result.get('raw_data_error'):
+        body += '<p>中文原始查看副本未成功生成：'+escape(result['raw_data_error'])+'。原始文件及本项统计仍保留，解决文件写入问题后可重新复算。</p>'
     if result.get('playback_notice_count'):
         body += '<p>播放缓冲/观测提示：'+str(result['playback_notice_count'])+'次；计时和采样未暂停，未据此判失败。具体北京时间见手工复测中的播放提示明细.csv。</p>'
     if 'workload_status' in conditions:

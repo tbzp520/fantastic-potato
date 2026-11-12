@@ -1,4 +1,4 @@
-"""实测30/60秒自动日志：设置→回读→保存CSV→3个采样→停止→核对。
+"""实测5/60秒自动日志：设置→回读→保存CSV→3个采样→停止→核对。
 
 不运行BIT，不播放视频，不改变网卡或时钟。数据只写入本次验证目录。
 """
@@ -138,7 +138,7 @@ def main():
     app.require_administrator()
     print('HWiNFO自动记录验证 v0.2.8（约3～5分钟）')
     print('请打开U盘中的 HWiNFO Sensors，并结束现有日志记录。')
-    print('将设置SMART每1个周期刷新，自动验证30秒和60秒记录；不用手工选择保存位置。')
+    print('将设置SMART每1个周期刷新，自动验证5秒和60秒记录；不用手工选择保存位置。')
     print('本步不运行BIT，不播放视频，也不切换网卡或校时。')
     input('准备好后按回车：')
     cfg = app.load_config()
@@ -160,12 +160,12 @@ def main():
             known_pid = pid
             report['hwinfo_pid'] = pid
         app.save_json(folder/'验证结果.json', report)
-        for interval in (30, 60):
+        for interval in (5, 60):
             print(f'正在验证 {interval} 秒：设置→回读→自动保存CSV→3个采样→停止。', flush=True)
             report['records'].append(record_three_samples(updated, folder/f'{interval}秒', interval))
             app.save_json(folder/'验证结果.json', report)
         report['passed'] = True
-        proof = {'verified_intervals_s': [30, 60], 'executable_sha256': app.sha256(executable),
+        proof = {'verified_intervals_s': [5, 60], 'executable_sha256': app.sha256(executable),
                  'sensor_group': updated['hwinfo']['expected_sensor_group'],
                  'verified_at': datetime.now().isoformat(timespec='seconds'),
                  'evidence_folder': str(folder),
@@ -173,7 +173,7 @@ def main():
         updated['hwinfo']['smart_refresh_verified'] = True
         updated['hwinfo']['logging_verification'] = proof
         app.save_setup_config(updated, 'HWiNFO自动记录验证', proof)
-        print('30秒、60秒自动记录均已通过，配置已保存。')
+        print('5秒、60秒自动记录均已通过，配置已保存。')
     except (Exception, KeyboardInterrupt) as exc:
         report['error'] = f'{type(exc).__name__}: {exc}'
         (folder/'未完成原因.txt').write_text(traceback.format_exc(), 'utf-8-sig')

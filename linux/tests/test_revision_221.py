@@ -15,7 +15,7 @@ from contextlib import ExitStack
 class DurationUpgradeTests(unittest.TestCase):
     def test_defaults_and_fio_command_are_900_seconds(self):
         for mode in ('read_1m','write_1m'):
-            self.assertEqual(CONFIG['tests'][mode],dict(duration_s=900,fio_duration_s=900,smart_interval_s=60))
+            self.assertEqual(CONFIG['tests'][mode],dict(duration_s=900,fio_duration_s=900,smart_interval_s=5,report_interval_s=30,report_points=20,sampling_profile=program.REPORT_PROFILE))
             self.assertIn('--runtime=900',program.build_fio_command(CONFIG,mode.split('_')[0],'/tmp/test',CONFIG['tests'][mode]['fio_duration_s']))
         self.assertEqual(CONFIG['tests']['l0_ps4'],dict(duration_s=1500,smart_interval_s=60))
         self.assertEqual(CONFIG['tests']['l12_ps4'],dict(duration_s=2000,smart_interval_s=1500))

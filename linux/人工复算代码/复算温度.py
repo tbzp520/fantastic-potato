@@ -11,6 +11,8 @@ import json
 import math
 from pathlib import Path
 import sys
+from report_sampling import PROFILE as REPORT_PROFILE, selected_report_rows
+from raw_host_export import export_raw_host_data, read_csv
 
 METRICS = ['CPU_Surface','NAND_Surface','AMB','Composite','CPU','NAND','BW(MiB/s)']
 
@@ -57,14 +59,18 @@ def calculate_last_ten_minutes(raw_rows, excluded, conditions):
     excluded_seconds = {row['原始相对秒'] for row in excluded}
     excluded_metrics = ['Composite','CPU','NAND'] if conditions['initial_smart_scope']=='round' else ['Composite']
     calculation_rows = []
+    sparse_report = conditions.get('sampling_profile') == REPORT_PROFILE
     for original in raw_rows:
-        if not begin<=original['Second']<end:
+        if not sparse_report and not begin<=original['Second']<end:
             continue
         row = dict(original)
         if row['Second'] in excluded_seconds:
             for metric in excluded_metrics:
                 row[metric] = None
         calculation_rows.append(row)
+    if sparse_report:
+        calculation_rows, _ = selected_report_rows(calculation_rows,end,
+            conditions['report_interval_s'],conditions['report_points'])
     statistics = {}
     for metric in METRICS:
         values = [row[metric] for row in calculation_rows if row[metric] is not None]
@@ -129,6 +135,12 @@ def recalculate(data_folder):
              '数据缺失详情见输入目录的缺失数据时间点.csv；复算不会补造缺失值。',
              '与原程序对照：'+('存在差异' if differences else '全部一致' if reference_file.exists() else '没有提供原程序结果'),
              *differences,*checks]
+    try:
+        export_raw_host_data(data_folder,smart_rows,read_csv(data_folder/'JK808逐秒原始数据.csv'),
+                             calculation_rows,statistics,dict(conditions,说明='独立复算；沿用原始条件和原选点规则'),
+                             output/'原始主机数据')
+    except Exception as error:
+        lines.append('原始主机数据查看副本未完整生成；复算统计已保存，可离线重试导出：'+str(error))
     (output/'复算说明与对照.txt').write_text('\n'.join(lines),'utf-8-sig')
     print('\n'.join(lines))
     print('复算结果保存到：'+str(output))

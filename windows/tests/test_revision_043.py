@@ -1,4 +1,4 @@
-"""图表回归：可见温度标注、真实点边界、Excel 图片范围及人工版本保留。"""
+"""图表回归：统一实线、真实点边界、Excel 图片范围及人工版本保留。"""
 import copy
 import math
 from pathlib import Path
@@ -25,35 +25,33 @@ class PlotTests(unittest.TestCase):
         import matplotlib.pyplot as plt
         plt.close('all')
 
-    def test_all_selected_smart_points_have_numeric_labels_in_linux_colors(self):
-        for count in (10, 12, 20):
+    def test_all_six_lines_use_confirmed_colors_widths_and_original_values(self):
+        for count in (10, 12, 20, 120):
             rows = points(count)
             original = copy.deepcopy(rows)
             fig = report.create_selected_points_figure(rows, '温度测试')
             ax = fig.axes[0]
-            self.assertEqual(len(ax.texts), count*3)
-            for metric, color in [('Composite','#7209B7'),('CPU','#9C6615'),('NAND','#2D9596')]:
-                labels = [t for t in ax.texts if t.get_color() == color]
-                self.assertEqual([t.get_text() for t in labels], [f'{r[metric]:.0f}' for r in rows])
-                self.assertEqual([t.get_position()[0] for t in labels], [r['plot_second'] for r in rows])
+            self.assertEqual(len(ax.texts), 0)
+            styles = [('CPU_Surface','#FF0000',.9),('NAND_Surface','#4A91FA',.9),('AMB','#228B22',.9),
+                      ('Composite','#7209B7',1.7),('CPU','#FF0000',1.7),('NAND','#4A91FA',1.7)]
+            for line, (metric,color,width) in zip(ax.lines,styles):
+                self.assertEqual(line.get_color(),color)
+                self.assertEqual(line.get_linewidth(),width)
+                self.assertEqual(line.get_linestyle(),'-')
+                self.assertIn(line.get_marker(),(None,'None',''))
+                self.assertEqual(list(line.get_ydata()),[r[metric] for r in rows])
             self.assertEqual(rows, original, '绘图不能改变原始数据或统计输入')
             for line in ax.lines:
                 self.assertEqual(list(line.get_xdata()), [r['plot_second'] for r in rows])
                 self.assertEqual(len(line.get_ydata()), count)
-            self.assertEqual(len(ax.collections), 3)
+            self.assertEqual(len(ax.collections), 0)
 
-    def test_label_boxes_fit_inside_export_and_avoid_each_other_with_twenty_points(self):
+    def test_normal_temperature_axis_and_last_true_point_are_preserved(self):
         fig = report.create_selected_points_figure(points(), 'Windows_BIT')
         fig.canvas.draw()
-        renderer = fig.canvas.get_renderer()
-        boxes = [t.get_window_extent(renderer) for t in fig.axes[0].texts]
-        for box in boxes:
-            self.assertGreaterEqual(box.x0, 0)
-            self.assertLessEqual(box.x1, fig.bbox.width)
-            self.assertGreaterEqual(box.y0, 0)
-            self.assertLessEqual(box.y1, fig.bbox.height)
-        for index, box in enumerate(boxes):
-            self.assertFalse(any(box.overlaps(other) for other in boxes[index+1:]))
+        self.assertEqual(fig.axes[0].get_ylim(),(0,110))
+        for line in fig.axes[0].lines:
+            self.assertEqual(line.get_xdata()[-1],570)
 
     def test_png_uses_linux_figure_size_and_300dpi(self):
         from PIL import Image
@@ -61,8 +59,7 @@ class PlotTests(unittest.TestCase):
             path = Path(directory)/'plot.png'
             report.draw_selected_points(points(), path, 'Windows_BIT')
             with Image.open(path) as image:
-                self.assertGreaterEqual(image.width, 2900)
-                self.assertGreaterEqual(image.height, 1700)
+                self.assertEqual(image.size, (3000,1800))
                 self.assertAlmostEqual(image.info['dpi'][0], 300, delta=.1)
         fig = report.create_selected_points_figure(points(), 'Windows_BIT')
         self.assertEqual(list(fig.get_size_inches()), [10, 6])
@@ -72,28 +69,26 @@ class PlotTests(unittest.TestCase):
         rows[4]['NAND'] = None
         fig = report.create_selected_points_figure(rows, 'gap')
         ax = fig.axes[0]
-        self.assertEqual(len(ax.texts), 29)
+        self.assertEqual(len(ax.texts), 0)
         nand = next(line for line in ax.lines if line.get_label() == 'NAND')
         self.assertTrue(math.isnan(nand.get_ydata()[4]))
 
-    def test_idle_labels_are_not_hidden_by_other_temperature_points(self):
+    def test_equal_temperatures_are_drawn_without_offsetting_data(self):
         rows = points(10)
         for row in rows:
             row.update(Composite=32, CPU=39, NAND=32, CPU_Surface=33, NAND_Surface=32.5, AMB=16)
         fig = report.create_selected_points_figure(rows, 'Windows_待机')
-        for label in fig.axes[0].texts:
-            _, height = label.get_position()
-            self.assertTrue(all(abs(height-rows[0][key]) >= 3 for key in report.TEMPERATURES))
-            self.assertGreater(label.get_zorder(), 5)
+        self.assertEqual(len(fig.axes[0].texts),0)
+        self.assertEqual(list(fig.axes[0].lines[3].get_ydata()),[32]*10)
 
-    def test_out_of_usual_range_and_labels_are_not_clipped(self):
+    def test_out_of_usual_range_values_expand_axis_without_clipping(self):
         rows = points(10)
         for row in rows:
             row.update(Composite=150, CPU=-5, NAND=-5)
         fig = report.create_selected_points_figure(rows, 'range')
         low, high = fig.axes[0].get_ylim()
-        self.assertLess(low, -21)
-        self.assertGreater(high, 158)
+        self.assertLessEqual(low, -5)
+        self.assertGreaterEqual(high, 150)
 
 
 class WorkbookTests(unittest.TestCase):

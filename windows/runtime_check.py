@@ -13,7 +13,7 @@ import warnings
 ROLE_NAMES = {'host': '测试主机', 'receiver': '接收电脑'}
 ROLE_MODULES = {
     'host': ('serial', 'pythoncom', 'win32api', 'win32gui', 'win32ui',
-             'pywinauto', 'playwright.sync_api'),
+             'pywinauto'),
     'receiver': ('serial', 'serial.tools.list_ports', 'hid', 'numpy',
                  'PIL.Image', 'matplotlib.backends.backend_agg'),
 }

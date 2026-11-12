@@ -15,6 +15,7 @@ import windows_temperature_test as app
 import resume_flow as flow
 import temperature_report as report
 from test_revision_037 import write_fixture, configuration, good_host_status
+from platform_fixtures import fixture_platform_refresh
 
 
 LEGACY_ORDER = ('idle', 'local_video', 'online_video', 'bit')
@@ -142,7 +143,7 @@ class ResumeTests(unittest.TestCase):
                 app.resume_failed_flow(cfg,root)
             start.assert_called_once()
             stats=flow.read_json(root/'手工复测/结果汇总.json')
-            self.assertEqual([stats[m]['selected_count'] for m in LEGACY_ORDER],[10,12,12,20])
+            self.assertEqual([stats[m]['selected_count'] for m in LEGACY_ORDER],[10,20,20,120])
             self.assertEqual(stats['idle']['statistics']['CPU_Surface']['mean'],48)
             self.assertEqual(stats['online_video']['statistics']['CPU_Surface']['mean'],70)
             self.assertTrue(flow.read_json(root/'手工复测/任务结果.json')['completed'])
@@ -185,12 +186,25 @@ class ResumeTests(unittest.TestCase):
             self.assertFalse(summaries['idle']['workload_ok'])
             self.assertFalse(flow.read_json(root/'手工复测/任务结果.json')['completed'])
 
-    def test_corrupt_data_or_missing_surface_requires_retry_even_with_old_good_summary(self):
-        for path in ('主机数据/idle/hwinfo.csv','jk808.jsonl'):
+    def test_missing_raw_data_requires_retry_even_with_old_good_summary(self):
+        for path in ('主机数据/idle/hwinfo.csv','both_surface_files'):
             with tempfile.TemporaryDirectory() as directory:
                 root=Path(directory);fixture_task(root,['idle'],['idle'])
-                (root/'手工复测'/path).unlink()
+                if path=='both_surface_files':
+                    (root/'手工复测/jk808.jsonl').unlink()
+                    (root/'手工复测/主机数据/idle/jk808.jsonl').unlink()
+                else:
+                    (root/'手工复测'/path).unlink()
                 self.assertEqual(flow.plan(root)[-1],['idle'])
+
+    def test_missing_global_surface_keeps_complete_stage_raw_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);fixture_task(root,['idle'],['idle'])
+            stage=root/'手工复测/主机数据/idle/jk808.jsonl'
+            saved=stage.read_bytes()
+            (root/'手工复测/jk808.jsonl').unlink()
+            self.assertEqual(flow.plan(root)[-1],[])
+            self.assertEqual(stage.read_bytes(),saved)
 
     def test_wrong_disk_same_capacity_and_wrong_project_or_batch_are_blocked(self):
         original=config()['report']
@@ -204,7 +218,7 @@ class ResumeTests(unittest.TestCase):
             root=Path(directory);cfg=fixture_task(root,['idle'],[])
             link=Mock()
             link.request.side_effect=[dict(protocol=2,version=app.VERSION,station=cfg['station'],busy=False),
-                {'sample':{**cfg['report'],'expected_serial':'DIFFERENT'}}]
+                {'sample':{**cfg['report'],'expected_serial':'DIFFERENT'},'platform':cfg['detected_platform']}]
             with patch.object(app,'require_administrator'),patch.object(app,'SerialConnection',return_value=link), \
                  patch.object(app,'synchronize_two_clocks') as clock,patch.object(app,'adopt_current_sample') as adopt:
                 with self.assertRaisesRegex(ValueError,'身份不一致'):
@@ -263,7 +277,8 @@ class ResumeTests(unittest.TestCase):
             cfg['thermometer'].update(protocol_verified=True,hid_path_hex='00')
             controller=app.HostController(copy.deepcopy(cfg));calls=[];ran=[]
             raw=(root/'手工复测/jk808.jsonl').read_text('utf-8').replace('"CPU_Surface": 48','"CPU_Surface": 70')
-            def remote_run(active,modes):
+            def remote_run(active,modes,skip_first_wait=False):
+                self.assertFalse(skip_first_wait)  # D续测保留本来的项目等待。
                 ran.extend(modes)
                 for mode in modes:write_fixture(controller.folder/mode,mode)
                 app.save_json(controller.folder/'config_snapshot.json',active)
@@ -290,6 +305,7 @@ class ResumeTests(unittest.TestCase):
                 'synchronize_two_clocks':Mock(),'network_snapshot':Mock(return_value=[]),
                 'preflight_host':Mock(return_value=[]),'workload_window_problems':Mock(return_value=[]),
                 'recover_pending_network':Mock()}
+            replacements['refresh_test_platform']=Mock(side_effect=fixture_platform_refresh)
             controller.cfg['detected_disk']={'model':cfg['report']['system_disk_model']}
             for key,value in replacements.items():stack.enter_context(patch.object(app,key,value))
             stack.enter_context(patch.object(controller,'refresh_sample'))

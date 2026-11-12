@@ -22,7 +22,7 @@ def task_record(folder):
     return task
 
 
-def check_identity(original, current, *, disk_only=False):
+def check_identity(original, current, *, disk_only=False, physical=True):
     keys = IDENTITY[2:] if disk_only else IDENTITY
     for key in keys:
         expected = str(original.get(key) or '').strip()
@@ -30,6 +30,13 @@ def check_identity(original, current, *, disk_only=False):
         if not expected or expected != actual:
             raise ValueError('续测身份不一致：'+key+'（原任务 '+expected+'，当前 '+actual+
                              '）。未启动测试；换盘或更换项目批次请选B新建任务。')
+    if any(report.get(key) for report in (original, current) for key in ('platform_id', 'machine_id')):
+        from platform_identity import check_platform_identity
+        try:
+            check_platform_identity(original, current, physical=physical)
+        except ValueError as exc:
+            raise ValueError('续测测试平台身份不一致：'+str(exc)+
+                             '；未启动负载。可选C补取原始数据或离线复算，无需重跑；换机请新建任务及批次。') from exc
 
 
 def attempts(root):
@@ -82,7 +89,7 @@ def stage_completed(result):
 
 def plan(root):
     """重新检查实际原始数据，不单凭以前的绿色结果或人工编辑的汇总决定跳过。"""
-    from temperature_report import build_stage_report
+    from temperature_report import build_stage_report, sync_surface_source
     root = Path(root).resolve()
     original = task_record(root)
     sources, completed = {}, set()
@@ -112,9 +119,11 @@ def plan(root):
                 if (conditions.get('mode') != mode or
                     conditions.get('interval_s') != setting['interval_s'] or
                     conditions.get('points') != setting['points'] or
+                    conditions.get('plot_interval_s',conditions.get('interval_s')) != setting.get('plot_interval_s',setting['interval_s']) or
+                    conditions.get('window_s') != setting.get('window_s') or
                     abs(conditions['end_epoch']-conditions['start_epoch']-setting['duration_s']) > 0.01):
                     continue
-                shutil.copy2(manual/'jk808.jsonl', stage/'jk808.jsonl')
+                sync_surface_source(manual/'jk808.jsonl', stage/'jk808.jsonl')
                 result, _ = build_stage_report(stage)
                 if stage_completed(result):
                     sources[mode] = folder

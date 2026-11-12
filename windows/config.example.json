@@ -1,5 +1,5 @@
 {
-  "_说明": "首次启动自动生成 config.json；先填写可访问的 NTP、本地视频路径和在线视频网址。盘信息与网卡自动识别。更新保留现场 config.json。",
+  "_说明": "首次启动自动创建config.json。填写项目、批次、可访问的NTP、本地视频路径及在线视频网址；实际主机与系统盘由程序识别。更新保留各自配置。",
   "station": "WIN-SSD-01",
   "serial": {
     "receiver_port": "",
@@ -21,7 +21,10 @@
     "capacity": "",
     "platform": "",
     "cpu": "",
-    "os": "Windows 11",
+    "os": "",
+    "bios": "",
+    "machine_id": "",
+    "platform_id": "",
     "test_version": "",
     "system_disk_model": "",
     "time_tolerance_s": 2.0,
@@ -63,23 +66,7 @@
       "backend": "win32"
     },
     "smart_refresh_verified": false,
-    "expected_sensor_group": "",
-    "expected_header": [
-      "Date",
-      "Time",
-      "Drive Temperature [°C]",
-      "Drive Temperature 2 [°C]",
-      "Drive Temperature 3 [°C]",
-      "Drive Remaining Life [%]",
-      "Drive Available Spare [%]",
-      "Drive Failure [Yes/No]",
-      "Drive Warning [Yes/No]",
-      "Total Host Writes [GB]",
-      "Total Host Reads [GB]",
-      ""
-    ],
-    "source": "usb",
-    "usb": {}
+    "source": "usb"
   },
   "local_video": {
     "file": "",
@@ -94,6 +81,8 @@
     }
   },
   "online_video": {
+    "browser_control": "native_edge",
+    "adapter": "bilibili_1080",
     "url": "",
     "browser": "msedge",
     "profile": "browser_profile",
@@ -149,27 +138,34 @@
     },
     "local_video": {
       "duration_s": 1200,
-      "interval_s": 60,
-      "points": 12,
+      "interval_s": 5,
+      "points": 20,
       "wait_before_s": 120,
-      "network": "offline"
+      "network": "offline",
+      "plot_interval_s": 30,
+      "window_s": 600
     },
     "online_video": {
       "duration_s": 1200,
-      "interval_s": 60,
-      "points": 12,
+      "interval_s": 5,
+      "points": 20,
       "wait_before_s": 120,
-      "network": "online"
+      "network": "online",
+      "plot_interval_s": 30,
+      "window_s": 600
     },
     "bit": {
       "duration_s": 900,
-      "interval_s": 30,
-      "points": 20,
+      "interval_s": 5,
+      "points": 120,
       "wait_before_s": 120,
-      "network": "offline"
+      "network": "offline",
+      "plot_interval_s": 5,
+      "window_s": 600
     }
   },
   "config_updates": {
-    "wait_before_120s_20261021": true
+    "wait_before_120s_20261021": true,
+    "smart5_plot30_bit120_20261108": true
   }
 }

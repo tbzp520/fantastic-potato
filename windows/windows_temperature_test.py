@@ -32,11 +32,14 @@ from contextlib import contextmanager, redirect_stdout
 
 from serial_link import SerialConnection, RequestServer
 from hardware_support import JK808Thermometer, obtain_internet_standard_time, standard_time_now, set_windows_system_time
-from temperature_report import read_hwinfo, export_stage, write_stage_failure, write_csv, LABELS, artifact_stem
+from temperature_report import read_hwinfo, export_stage, write_stage_failure, write_csv, LABELS, artifact_stem, sync_surface_source
+from capacity_template import CAPACITIES, capacity_from_bytes
 from media_session import read_media_sessions, window_app_ids
 from resume_flow import MODES as ORDER
+from platform_identity import (REPORT_PLATFORM_KEYS, refresh_platform, sync_platform_report,
+                               check_platform_identity)
 
-VERSION = '0.4.12 在线视频优先版'
+VERSION = '0.4.22 登录后全屏修复版'
 ROOT = Path(__file__).resolve().parent
 CONFIG = ROOT/'config.json'
 BJ = timezone(timedelta(hours=8))
@@ -68,6 +71,9 @@ def load_config():
         shutil.copy2(ROOT/'config.example.json', CONFIG)
     cfg = json.loads(CONFIG.read_text(encoding='utf-8-sig'))
     migrate_test_waits(cfg)
+    migrate_sampling_rules(cfg)
+    if isinstance(cfg.get('online_video'), dict):
+        cfg['online_video'].setdefault('browser_control', 'native_edge')
     return cfg
 
 
@@ -88,6 +94,26 @@ def migrate_test_waits(cfg):
     cfg.setdefault('config_updates', {})[key] = True
     save_json(CONFIG, cfg)
     print('已将四项正式测试的开始前等待统一设为120秒；采样周期和测试时长保留。', flush=True)
+
+
+def migrate_sampling_rules(cfg):
+    """迁移现场旧配置，备份后只改指定三项的采集/绘图参数。待机不变。"""
+    key = 'smart5_plot30_bit120_20261108'
+    if cfg.get('config_updates', {}).get(key):
+        return False
+    tests = cfg.get('tests', {})
+    if not all(isinstance(tests.get(mode), dict) for mode in ORDER):
+        return False
+    backup = ROOT/'部署记录'/('采样规则升级_'+datetime.now(BJ).strftime('%Y%m%d_%H%M%S')+'_'+uuid.uuid4().hex[:6])
+    backup.mkdir(parents=True, exist_ok=False)
+    (backup/'config.before.json').write_bytes(CONFIG.read_bytes())
+    for mode in ('local_video', 'online_video'):
+        tests[mode].update(interval_s=5, plot_interval_s=30, points=20, window_s=600)
+    tests['bit'].update(interval_s=5, plot_interval_s=5, points=120, window_s=600)
+    cfg.setdefault('config_updates', {})[key] = True
+    save_json(CONFIG, cfg)
+    print('已备份并升级采样规则：视频SMART每5秒、每30秒取点；BIT每5秒取点；均选连续10分钟。待机保留。', flush=True)
+    return True
 
 
 def safe_name(value):
@@ -687,8 +713,8 @@ def preflight_host(cfg, modes):
     if any(mode not in ORDER for mode in modes) or not modes or len(set(modes))!=len(modes):
         return ['测试项目无效']
     hw = cfg['hwinfo']
-    if cfg['report']['capacity'] not in ('512G','1T','2T'):
-        problems.append('公司模板容量应为512G、1T或2T')
+    if cfg['report']['capacity'] not in CAPACITIES:
+        problems.append('公司模板容量应为128G、256G、512G、1T或2T')
     try:
         hw['executable']=str(resolve_hwinfo_executable(hw))
     except (OSError,ValueError,RuntimeError) as exc:
@@ -709,23 +735,51 @@ def preflight_host(cfg, modes):
                 or type(item.get('wait_before_s')) not in (int,float)
                 or not math.isfinite(item['wait_before_s']) or item['wait_before_s']<0):
             problems.append(mode+'的时长/间隔/点数无效')
-        elif item['duration_s']<(item['points']-1)*item['interval_s']:
+        elif item['duration_s']<(item['points']-1)*item.get('plot_interval_s',item['interval_s']):
             problems.append(mode+'的时长不足以取得所需连续点')
+        if item.get('window_s') is not None:
+            try:
+                from temperature_report import validate_sampling_geometry
+                validate_sampling_geometry(item['interval_s'], item.get('plot_interval_s',item['interval_s']),
+                                           item['points'], item['window_s'])
+                if item['duration_s'] < item['window_s']:
+                    problems.append(mode+'的时长不足完整选点窗口')
+            except (ValueError,TypeError,KeyError) as exc:
+                problems.append(mode+'的采集/绘图规则无效：'+str(exc))
         if item.get('network')!=('online' if mode=='online_video' else 'offline'):
             problems.append(mode+'的联网状态与已确定测试要求不符')
     if 'local_video' in modes:
         video = cfg['local_video']
         if not Path(video['file']).is_file():
             problems.append('未找到本地视频')
+        else:
+            from portable_tools import on_system_drive
+            if not on_system_drive(video['file'],cfg.get('detected_disk',{}).get('drive')):
+                problems.append('本地视频必须在被测系统盘，请重新定位本机视频路径')
         if not video['ui'].get('window'):
             problems.append('本地播放器窗口待适配')
     if 'online_video' in modes and not cfg['online_video'].get('quality_selector') and cfg['online_video'].get('adapter') != 'bilibili_1080':
         problems.append('B站1080p清晰度控件待实机适配')
+    if 'online_video' in modes:
+        try:
+            from native_edge import inspect_native_edge
+            browser = inspect_native_edge()
+            if not browser.get('passed'):
+                problems.append('常用Edge环境检查：'+str(browser.get('error') or '未找到可用的本机Edge及用户环境'))
+        except (OSError, RuntimeError, ValueError) as exc:
+            problems.append('常用Edge环境检查：'+str(exc))
     if 'bit' in modes:
         bit = cfg['burnintest']
         path = Path(bit['configuration'])
         if not Path(bit['executable']).is_file():
             problems.append('未找到BurnInTest程序')
+        else:
+            try:
+                version=bit_program_version(bit['executable'])
+                if list(version[:3]) != [9,0,1003]:
+                    problems.append('BIT版本不是已适配的9.0 build1003：'+str(version))
+            except Exception as exc:
+                problems.append('BIT版本读取失败：'+str(exc))
         if not path.is_file() or path.suffix.lower() != '.bitcfg':
             problems.append('需要真实.bitcfg，不能使用.lnk快捷方式')
         elif sha256(path).lower() != bit.get('configuration_sha256','').lower():
@@ -921,12 +975,12 @@ def refresh_system_disk(cfg):
     if not model or not serial:
         raise RuntimeError('系统盘型号或序列号为空')
     detected.update(model=model, serial=serial, drive=detected.get('drive','C:').upper())
-    capacity = {512:'512G',1000:'1T',2000:'2T'}
-    match = [label for gb,label in capacity.items() if abs(detected['bytes']/1e9-gb)<gb*.08]
-    if len(match)!=1:
-        raise RuntimeError('系统盘容量不在当前公司模板512G/1T/2T范围')
+    try:
+        capacity = capacity_from_bytes(detected['bytes'])
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
     cfg['detected_disk'] = detected
-    cfg['report'].update(capacity=match[0],system_disk_model=model,expected_serial=serial)
+    cfg['report'].update(capacity=capacity,system_disk_model=model,expected_serial=serial)
     expected = f'S.M.A.R.T.: {model} ({serial}) [{detected.get("drive","C:")}]'
     if storage_identifier_is_eui(serial):
         binding = cfg['hwinfo'].get('system_disk_binding', {})
@@ -944,6 +998,17 @@ def refresh_system_disk(cfg):
         cfg['hwinfo'].pop('logging_verification',None)
         cfg['hwinfo']['smart_refresh_verified'] = False
         cfg['hwinfo']['expected_sensor_group'] = expected
+
+
+def refresh_test_platform(cfg):
+    """仅测试主机调用；平台读取失败时清除旧自动字段，不能借用接收端信息。"""
+    try:
+        return refresh_platform(cfg, powershell)
+    except Exception as exc:
+        cfg.pop('detected_platform', None)
+        for key in REPORT_PLATFORM_KEYS:
+            cfg.setdefault('report', {})[key] = ''
+        raise RuntimeError('测试主机平台读取失败：'+str(exc)) from exc
 
 
 def storage_identifier_is_eui(serial):
@@ -1207,8 +1272,8 @@ def save_hwinfo_failure_context(pid, folder):
 
 def configure_hwinfo_sampling(sensor, interval_s, record_path):
     """每项测试开始前设置并重新打开核对，防止上次的30秒或100倍周期残留。"""
-    if interval_s not in (30, 60):
-        raise ValueError('当前已适配的HWiNFO刷新间隔为30秒或60秒')
+    if interval_s not in (5, 30, 60):
+        raise ValueError('当前已适配的HWiNFO刷新间隔为5秒、30秒或60秒')
     if hwinfo_log_button_state(sensor) != 'stopped':
         raise RuntimeError('HWiNFO已有日志正在记录，请先结束该记录；未更改其设置')
     dialog = None
@@ -1820,20 +1885,35 @@ def restore_bilibili_quality(page, sample, attempts):
     record = {'epoch':time.time(), 'attempt':attempts['count'],
               'before':sample.get('quality'), 'action':'实际画面低于最低要求，重新请求1080P'}
     try:
-        select_bilibili_1080(page, timeout=1000, force=True)
+        if _is_native_online_page(page):
+            page.select_quality()
+        else:
+            select_bilibili_1080(page, timeout=1000, force=True)
         record['result'] = '已请求，等待后续实际档位/分辨率/帧率验证'
     except Exception as exc:
         record['result'] = '重选失败：'+str(exc)
     return record
 
 
+def _is_native_online_page(page):
+    """检测显式session接口，兼容历史测试的动态Mock页面。"""
+    return callable(getattr(type(page), 'sample', None)) or callable(getattr(page, '__dict__', {}).get('sample'))
+
+
 def stop_online_video(workload):
-    """即使浏览器窗口关闭报错，也释放本轮Playwright运行时。"""
+    """普通Edge仅关闭本轮窗口；旧回归仍释放自己的Playwright运行时。"""
+    session = workload.get('session') or workload.get('page')
+    if workload.get('adapter') == 'native_edge' or (session is not None and _is_native_online_page(session)):
+        if session is None:
+            raise RuntimeError('本轮Edge会话缺失，无法确认浏览器收尾')
+        session.close()
+        return
     try:
         if workload.get('context'):
             workload['context'].close()
     finally:
-        workload['runtime'].stop()
+        if workload.get('runtime'):
+            workload['runtime'].stop()
 
 
 def maximize_online_video_window(context, page):
@@ -2224,11 +2304,22 @@ def open_online_video_page(page, cfg, stop=None, status=None):
 
 
 def start_online_video(cfg, stop=None, status=None):
+    """正式唯一入口：复用本机常用Edge环境，不创建独立浏览器配置。"""
+    from native_edge import start_online_video as start_native_edge
+    return start_native_edge(cfg, stop=stop, status=status)
+
+
+def _start_legacy_online_video(cfg, stop=None, status=None):
+    """仅供历史Playwright回归；正式菜单及失败流程不会调用此函数。"""
     from playwright.sync_api import sync_playwright
+    from runtime_integrity import require_browser_driver
     settings = cfg['online_video']
-    runtime = sync_playwright().start()
+    record = Path(cfg['_diagnostic_folder'])/'浏览器组件检查.json' if cfg.get('_diagnostic_folder') else None
+    require_browser_driver(ROOT, record)
+    runtime = None
     context = None
     try:
+        runtime = sync_playwright().start()
         context = runtime.chromium.launch_persistent_context(str(ROOT/settings['profile']),
             channel=settings['browser'],headless=False,viewport=None,args=['--start-maximized'])
         page = context.pages[0] if context.pages else context.new_page()
@@ -2270,6 +2361,8 @@ def start_online_video(cfg, stop=None, status=None):
 
 def online_video_status(page):
     """在同一次DOM读取中确定视频、帧数与全屏状态，避免切流后混入另一个video。"""
+    if _is_native_online_page(page):
+        return page.sample()
     from playwright.sync_api import Error as BrowserError
     try:
         sample = page.evaluate(ONLINE_VIDEO_SNAPSHOT_SCRIPT)
@@ -2287,6 +2380,8 @@ def online_video_status(page):
 
 def runtime_online_video_status(page):
     """切流最多补看2.5秒；没有读到时明确返回不可用，绝不编造进度和温度。"""
+    if _is_native_online_page(page):
+        return page.sample()
     observations=[]
     deadline=time.monotonic()+2.5
     while True:
@@ -2946,7 +3041,7 @@ def minimize_owned_hwinfo(cfg):
     window.minimize()
 
 
-def execute_stage(cfg, mode, folder, stop, status, original_network):
+def execute_stage(cfg, mode, folder, stop, status, original_network, *, skip_prepare_wait=False):
     """每个测试的顺序集中在此处，便于测试人员直接阅读。"""
     check_test_cancelled(stop)
     setting = cfg['tests'][mode]
@@ -2965,7 +3060,10 @@ def execute_stage(cfg, mode, folder, stop, status, original_network):
         except Exception as snapshot_error:detail['snapshot_error']=str(snapshot_error)
         save_json(folder/'network_switch_error.json',detail)
         raise
-    wait_seconds(setting['wait_before_s'],stop,status,'准备等待')
+    if not skip_prepare_wait:
+        wait_seconds(setting['wait_before_s'],stop,status,'准备等待')
+    else:
+        status['message'] = '整套首项在线视频：直接准备采样和播放验证'
     check_test_cancelled(stop)
     # 等待结束后才打开本轮日志、启动负载并确定正式时间。
     status.update(phase='启动采样',message=LABELS[mode]+'：正在启动HWiNFO，尚未开始测试计时')
@@ -2995,6 +3093,11 @@ def execute_stage(cfg, mode, folder, stop, status, original_network):
                       'time_tolerance_s':cfg['report']['time_tolerance_s'],
                       'surface_tolerance_s':cfg['report']['surface_tolerance_s'],
                       'workload_status':'正在运行'}
+        conditions['prepare_wait_s'] = 0 if skip_prepare_wait else setting['wait_before_s']
+        conditions['prepare_wait_skipped'] = bool(skip_prepare_wait)
+        for key in ('plot_interval_s', 'window_s'):
+            if key in setting:
+                conditions[key] = setting[key]
         if mode == 'local_video':
             conditions.update(timer_source='program_monotonic', position_monitoring=False,
                               playback_evidence=workload.get('playback_evidence'))
@@ -3187,6 +3290,7 @@ class HostController:
         self.worker = None
         self.folder = None
         self.job_id = None
+        self.task_config = None
         self.transfer_cache = None
         self.transfer_manifest = {}
         self.transfer_id = None
@@ -3220,8 +3324,9 @@ class HostController:
         return list(manifest.values())
 
     def refresh_sample(self):
-        """每次正式测试前重新读系统盘；EUI由Sensors补全真实序列号，不跑短测。"""
+        """每次正式测试前重新读本机平台及系统盘，不跑短测。"""
         try:
+            refresh_test_platform(self.cfg)
             refresh_system_disk(self.cfg)
             if storage_identifier_is_eui(self.cfg['detected_disk']['serial']):
                 launch_hwinfo(self.cfg)
@@ -3240,9 +3345,23 @@ class HostController:
             raise
         save_setup_config(self.cfg, '正式测试前自动读盘', self.cfg['detected_disk'])
 
-    def effective_config(self, received):
+    def effective_config(self, received, *, strict_platform=False):
         """工具路径、界面和CSV适配只在主机维护；测试参数及样品命名来自接收端。"""
         cfg=copy.deepcopy(received)
+        snapshot=self.cfg.get('detected_platform')
+        if snapshot is not None:
+            host_report=copy.deepcopy(self.cfg['report'])
+            sync_platform_report(host_report,snapshot)
+            if strict_platform:
+                check_platform_identity(received['report'],host_report,physical=True)
+            cfg['detected_platform']=copy.deepcopy(snapshot)
+            cfg['report'].update({key:host_report[key] for key in REPORT_PLATFORM_KEYS})
+        else:
+            cfg.pop('detected_platform',None)
+            for key in REPORT_PLATFORM_KEYS:
+                cfg['report'][key]=''
+            if strict_platform:
+                raise RuntimeError('测试主机未提供本次平台信息，请重新选择B识别当前测试主机；未启动测试。')
         for key in HOST_TOOL_SECTIONS:
             cfg[key]=copy.deepcopy(self.cfg[key])
         if 'detected_disk' in self.cfg:
@@ -3271,13 +3390,23 @@ class HostController:
         if not record.get('finished') or not isinstance(status,dict) or not status.get('phase'):
             status={'phase':'未完成','job_id':job_id,'message':'上次主机执行端中断；只能回收已有数据，不自动重跑负载'}
         self.folder,self.job_id,self.status=folder,job_id,status
-        return {'job_id':job_id,'status':dict(status),'busy':False,'recovered':True}
+        snapshot=folder/'config_snapshot.json'
+        self.task_config=None
+        try:
+            saved=json.loads(snapshot.read_text('utf-8-sig'))
+            if isinstance(saved,dict) and isinstance(saved.get('report'),dict): self.task_config=saved
+        except (OSError,ValueError):
+            pass  # 配置损坏不能阻止只读回收原始文件，也不能借用当前主机身份。
+        original=self.task_config or {}
+        return {'job_id':job_id,'status':dict(status),'busy':False,'recovered':True,
+                'sample':{k:original.get('report',{}).get(k,'') for k in ('capacity','system_disk_model','expected_serial')},
+                'platform':copy.deepcopy(original.get('detected_platform'))}
 
     def check_file_job(self,data):
         if data.get('job_id')!=self.job_id or self.job_id is None:
             raise ValueError('回收任务编号不符，拒绝混入另一个任务的文件')
 
-    def run_job(self,cfg,modes):
+    def run_job(self,cfg,modes,skip_first_wait=False):
         original = None
         import pythoncom
         pythoncom.CoInitialize()
@@ -3294,11 +3423,27 @@ class HostController:
                 self.status.update(phase='完成' if passed else '未完成',
                     message='集中联调已结束，请回收全部结果'+('' if passed else '（有待处理项目）'))
             else:
-                for mode in modes:
-                    execute_stage(cfg,mode,self.folder/mode,self.stop,self.status,original)
+                for index, mode in enumerate(modes):
+                    if skip_first_wait and index == 0 and mode == 'online_video':
+                        execute_stage(cfg,mode,self.folder/mode,self.stop,self.status,original,skip_prepare_wait=True)
+                    else:
+                        execute_stage(cfg,mode,self.folder/mode,self.stop,self.status,original)
                 self.status.update(phase='完成',message='本批次完成，请回收数据')
         except BaseException as exc:
+            failed_phase = self.status.get('phase')
             self.status.update(phase='未完成',message=f'{type(exc).__name__}: {exc}')
+            failed_mode = self.status.get('mode')
+            if failed_mode in modes:
+                stage = self.folder/failed_mode
+                try:
+                    stage.mkdir(parents=True,exist_ok=True)
+                    failure = {'mode':failed_mode,'job_id':self.job_id,'phase':failed_phase,
+                               'formal_started':(stage/'conditions.json').is_file(),
+                               'error':self.status['message'],'exception_type':type(exc).__name__}
+                    if hasattr(exc,'details'): failure['details']=exc.details
+                    save_json(stage/'stage_failure.json',failure)
+                except OSError as record_error:
+                    self.status['message'] += '；保存启动失败记录时出错：'+str(record_error)
         finally:
             try:
                 if original is not None:
@@ -3347,6 +3492,7 @@ class HostController:
                     'network_config':cfg['network'],
                     'detected_disk':copy.deepcopy(self.cfg['detected_disk']),
                     'sample':{k:cfg['report'].get(k,'') for k in ('capacity','system_disk_model','expected_serial')},
+                    'platform':copy.deepcopy(cfg.get('detected_platform')),
                     'host_tools':{key:cfg[key] for key in HOST_TOOL_SECTIONS}}
         if command=='workload-windows':
             if busy:
@@ -3358,6 +3504,7 @@ class HostController:
             from 集中联调 import prepare_configuration
             self.cfg,issues=prepare_configuration(self.cfg,'host')
             return {'issues':issues,'host_tools':{k:self.cfg[k] for k in HOST_TOOL_SECTIONS},
+                    'platform':copy.deepcopy(self.cfg.get('detected_platform')),
                     'sample':{k:self.cfg['report'].get(k,'') for k in ('capacity','system_disk_model','expected_serial')}}
         if command=='open_job':
             return self.open_saved_job(data.get('job_id'))
@@ -3377,22 +3524,27 @@ class HostController:
                 raise ValueError('任务编号无效')
             # 即使同一任务以新的请求编号重发，也不重复执行负载。
             if job_id==self.job_id:
-                return {'job_id':job_id,'status':dict(self.status)}
+                original=self.task_config or {}
+                return {'job_id':job_id,'status':dict(self.status),
+                        'sample':{k:original.get('report',{}).get(k,'') for k in ('capacity','system_disk_model','expected_serial')},
+                        'platform':copy.deepcopy(original.get('detected_platform'))}
             if busy:
                 raise RuntimeError('主机已有任务运行')
             root = Path(self.cfg['host_workspace']).resolve()
             if (root/job_id).exists():
                 return self.open_saved_job(job_id)
-            cfg, modes = self.effective_config(data['config']),data['modes']
             kind = data.get('kind','formal')
             if kind not in ('formal','commissioning'):
                 raise ValueError('任务类型无效')
+            if kind=='formal':
+                if any(data['config']['report'].get(key) != self.cfg['report'].get(key)
+                       for key in ('capacity','system_disk_model','expected_serial')):
+                    raise RuntimeError('主机盘信息与本次接收端确认的信息不同，请重新选择B自动识别当前盘；未启动测试。')
+                refresh_test_platform(self.cfg)
+            cfg, modes = self.effective_config(data['config'],strict_platform=kind=='formal'),data['modes']
             if kind=='commissioning':
                 modes=list(ORDER)
                 cfg['_commissioning']=True
-            elif any(data['config']['report'].get(key) != self.cfg['report'].get(key)
-                     for key in ('capacity','system_disk_model','expected_serial')):
-                raise RuntimeError('主机盘信息与本次接收端确认的信息不同，请重新选择B自动识别当前盘；未启动测试。')
             problems = preflight_host(cfg,modes) if kind=='formal' else []
             problems.extend(workload_window_problems(cfg))
             if problems:
@@ -3404,11 +3556,15 @@ class HostController:
             save_json(self.folder/'task.json',{'job_id':job_id,'station':self.cfg['station'],
                       'modes':list(modes),'kind':kind,'created_epoch':time.time(),'finished':False})
             self.job_id=job_id
+            self.task_config=copy.deepcopy(cfg)
             self.stop.clear()
             self.status={'phase':'准备','job_id':job_id,'message':'即将开始'}
-            self.worker=threading.Thread(target=self.run_job,args=(cfg,modes),daemon=False)
+            skip_first_wait = kind == 'formal' and tuple(modes) == ORDER and not data.get('resume', False)
+            self.worker=threading.Thread(target=self.run_job,args=(cfg,modes,skip_first_wait),daemon=False)
             self.worker.start()
-            return {'job_id':job_id}
+            return {'job_id':job_id,
+                    'sample':{k:cfg['report'].get(k,'') for k in ('capacity','system_disk_model','expected_serial')},
+                    'platform':copy.deepcopy(cfg.get('detected_platform'))}
         if command=='status':
             return {'status':dict(self.status),'busy':busy,'job_id':self.job_id}
         if command=='cancel':
@@ -3581,12 +3737,14 @@ def report_filename(cfg, label, suffix):
     return artifact_stem(label, cfg['report'].get('capacity',''), cfg.get('_simulated',False))+suffix
 
 
-def write_task_report(cfg, folder, summaries, *, final_attempt=None, stage_sources=None, pending_modes=()):
+def write_task_report(cfg, folder, summaries, *, final_attempt=None, stage_sources=None, pending_modes=(), batch_summary=None):
     """把任务结束、网卡恢复和各项统计放在同一页，不能只看到曲线就误认整套成功。"""
     host = (final_attempt or folder)/'手工复测'/'主机数据'
     issues = []
     if pending_modes:
         issues.append('仍需重试或继续：'+'、'.join(LABELS[m] for m in pending_modes)+'；接收端选择D继续')
+    if batch_summary and not batch_summary.get('passed'):
+        issues.append('本次数据已保留，批次汇总未更新：'+batch_summary['error']+'；处理后选E重建批次汇总，不用重跑测试')
     if not cfg.get('_simulated'):
         try:
             state = json.loads((host/'status.json').read_text('utf-8'))
@@ -3624,6 +3782,10 @@ def write_task_report(cfg, folder, summaries, *, final_attempt=None, stage_sourc
         name = report_filename(cfg, LABELS[mode], '.html')
         body += '<tr><td>'+escape(LABELS[mode])+'</td><td>'+escape(part['status'])+'</td><td><a href="'+escape(name)+'">本项报告</a></td></tr>'
     body += '</table><p>原始数据、异常时间和复算代码位于手工复测文件夹。Excel为选点统计，不代表任务全部通过。</p>'
+    if batch_summary and batch_summary.get('passed'):
+        from urllib.parse import quote
+        relative = os.path.relpath(batch_summary['page'],folder).replace('\\','/')
+        body += '<p><a href="'+escape(quote(relative, safe='/'))+'">查看同项目、同批次的统一结果及Excel</a></p>'
     if stage_sources:
         body += '<h2>续测数据来源</h2><ul>'+''.join('<li>'+escape(LABELS[m])+'：'+
             escape(str(p.relative_to(folder)))+'</li>' for m,p in stage_sources.items())+'</ul>'
@@ -3664,10 +3826,9 @@ def finish_reports(cfg,folder,modes, *, stage_sources=None, final_attempt=None, 
     for mode in modes:
         source=(stage_sources or {}).get(mode,folder)/'手工复测'
         surface_path=source/'jk808.jsonl'
-        all_surface=surface_path.read_text(encoding='utf-8') if surface_path.is_file() else ''
         stage=source/'主机数据'/mode
         stage.mkdir(parents=True,exist_ok=True)
-        (stage/'jk808.jsonl').write_text(all_surface,encoding='utf-8')
+        sync_surface_source(surface_path, stage/'jk808.jsonl')
         try:
             if stage_sources is not None:
                 from resume_flow import transfer_complete
@@ -3689,6 +3850,11 @@ def finish_reports(cfg,folder,modes, *, stage_sources=None, final_attempt=None, 
         summaries[mode]=result
     save_json(manual/'结果汇总.json',summaries)
     write_task_report(cfg,folder,summaries,final_attempt=final_attempt,stage_sources=stage_sources,pending_modes=pending_modes)
+    batch_summary = update_batch_after_report(cfg,folder)
+    if batch_summary is not None:
+        save_json(manual/'批次汇总状态.json',batch_summary)
+        write_task_report(cfg,folder,summaries,final_attempt=final_attempt,stage_sources=stage_sources,
+                          pending_modes=pending_modes,batch_summary=batch_summary)
     # 旧版本固定名称移入原始资料，外层只显示这次按容量命名的报告。
     old_names=['本次结果.html','温度汇总.xlsx']+[LABELS[m]+suffix for m in modes for suffix in ('.png','.html')]
     for name in old_names:
@@ -3701,14 +3867,52 @@ def finish_reports(cfg,folder,modes, *, stage_sources=None, final_attempt=None, 
     return summaries
 
 
+def report_batch_folder(cfg):
+    return ROOT/cfg['output_dir']/safe_name(cfg['report']['project'])/safe_name(cfg['report']['batch'])
+
+
+def update_batch_after_report(cfg,folder):
+    """只处理批次直属正式测次；D续测子尝试由原任务合并后统一更新。"""
+    folder = Path(folder).resolve()
+    if cfg.get('_simulated') or cfg.get('_commissioning') or not (folder/'手工复测/本次任务.json').is_file():
+        return None
+    if (folder.parent.name != safe_name(cfg['report']['batch'])
+            or folder.parent.parent.name != safe_name(cfg['report']['project'])):
+        return None
+    try:
+        from batch_report import rebuild_batch
+        result=rebuild_batch(folder.parent,cfg['report']['project'],cfg['report']['batch'],ROOT/'温度模版_原始.xlsx')
+        print('本批次统一结果：'+result['page'],flush=True)
+        print('本批次统一表格：'+result['workbook'],flush=True)
+        return result
+    except Exception as exc:
+        print('批次汇总未更新：'+str(exc)+'；本次数据和单次结果已保留，可选E重新汇总。',flush=True)
+        return {'passed':False,'error':str(exc)}
+
+
+def rebuild_selected_batch(cfg,folder=None):
+    """菜单E：只读取已出表测次，不依赖串口、不重新施加负载。"""
+    from batch_report import rebuild_batch, discover_batch_names
+    explicit_folder=folder is not None
+    folder=Path(folder or report_batch_folder(cfg)).resolve()
+    project,batch=discover_batch_names(folder) if explicit_folder else (cfg['report']['project'],cfg['report']['batch'])
+    result=rebuild_batch(folder,project,batch,ROOT/'温度模版_原始.xlsx')
+    print('本批次统一结果：'+result['page'],flush=True)
+    print('本批次统一表格：'+result['workbook'],flush=True)
+    return result
+
+
 def adopt_current_sample(cfg, check):
-    """只接受主机本次返回的盘身份，不用接收端保存的上一张盘补缺值。"""
+    """接收端只同步测试主机本次平台和盘身份，不识别接收电脑冒充被测机。"""
     sample = check.get('sample', {})
-    if (sample.get('capacity') not in ('512G','1T','2T')
+    if (sample.get('capacity') not in CAPACITIES
             or not str(sample.get('system_disk_model') or '').strip()
             or not str(sample.get('expected_serial') or '').strip()):
         raise RuntimeError('主机未返回完整的当前系统盘型号、容量和序列号；未开始测试，请查看主机读盘提示。')
     cfg=copy.deepcopy(cfg)
+    platform=copy.deepcopy(check.get('platform'))
+    sync_platform_report(cfg['report'],platform)
+    cfg['detected_platform']=platform
     cfg.update(copy.deepcopy(check['host_tools']))
     for key in ('capacity','system_disk_model','expected_serial'):
         cfg['report'][key]=sample[key]
@@ -3719,6 +3923,8 @@ def adopt_current_sample(cfg, check):
     print('当前测试盘：'+cfg['report']['system_disk_model']+'；容量：'+cfg['report']['capacity']+
           '；序列号：'+cfg['report']['expected_serial'],flush=True)
     print('项目：'+cfg['report']['project']+'；批次：'+cfg['report']['batch'],flush=True)
+    print('当前测试平台：'+cfg['report']['platform']+'；CPU：'+cfg['report']['cpu']+
+          '；系统：'+cfg['report']['os']+'；BIOS：'+cfg['report']['bios'],flush=True)
     return cfg
 
 
@@ -3743,10 +3949,16 @@ def run_receiver(cfg,modes, *, resume_folder=None):
             from resume_flow import check_identity, task_record
             original=task_record(resume_folder)['config']
             check_identity(original['report'],cfg['report'])
-            check_identity(original['report'],check.get('sample',{}),disk_only=True)
+            host_report=copy.deepcopy(check.get('sample',{}))
+            sync_platform_report(host_report,check.get('platform'))
+            check_identity(original['report'],host_report,disk_only=True)
+            check_platform_identity(original['report'],host_report,physical=True)
         cfg=adopt_current_sample(cfg,check)
         if check['problems']:
             raise ValueError('\n'.join(check['problems']))
+        from batch_report import check_batch_target
+        batch_folder=Path(resume_folder).resolve().parent if resume_folder is not None else report_batch_folder(cfg)
+        check_batch_target(batch_folder,cfg['report'])
         if not cfg['thermometer']['protocol_verified'] or not cfg['thermometer']['hid_path_hex']:
             raise ValueError('请先部署识别JK808并核对三个通道')
         # 先实读一次，避免仪器没有接好仍在主机上运行完整套负载。
@@ -3765,7 +3977,7 @@ def run_receiver(cfg,modes, *, resume_folder=None):
         save_json(manual/'程序版本核对.json',{'receiver':{'version':VERSION,'program_dir':str(ROOT),
                     'main_sha256':sha256(Path(__file__))},
                     'host':{k:hello.get(k) for k in ('version','program_dir','main_sha256')}})
-        save_json(manual/'本次任务.json',{'job_id':task,'config':cfg,'modes':modes})
+        save_json(manual/'本次任务.json',{'job_id':task,'config':cfg,'modes':modes,'created_epoch':time.time()})
         save_json(manual/'接收进度.json',{'phase':'not_started','job_id':task})
         if resume_folder is not None:
             from resume_flow import add_attempt
@@ -3773,6 +3985,9 @@ def run_receiver(cfg,modes, *, resume_folder=None):
         save_json(ROOT/'部署记录/最近正式任务.json',{'folder':str(Path(resume_folder or folder).resolve())})
         print('本次结果目录：'+str(folder),flush=True)
         synchronize_two_clocks(cfg,link,manual)
+        task_metadata=json.loads((manual/'本次任务.json').read_text('utf-8'))
+        task_metadata['created_epoch']=time.time()  # 统一结果按NTP校准后的测次起点排序。
+        save_json(manual/'本次任务.json',task_metadata)
         # 先启动采集，避免串口轮询延迟丢掉主机开始后的首秒；等待段保留原始记录但不参与统计。
         collector=threading.Thread(target=collect_jk808,args=(cfg,manual/'jk808.jsonl',stop,collector_errors),daemon=False)
         collector.start()
@@ -3780,7 +3995,10 @@ def run_receiver(cfg,modes, *, resume_folder=None):
             raise OSError('JK808采集文件无法保存：'+collector_errors[0])
         save_json(manual/'接收进度.json',{'phase':'start_requested','job_id':task})
         submitted=True  # 启动回包丢失也必须按此任务编号取消，不能漏停。
-        link.request('start',{'job_id':task,'config':cfg,'modes':modes},timeout=180)
+        started=link.request('start',{'job_id':task,'config':cfg,'modes':modes,'resume':resume_folder is not None},timeout=180)
+        started_report=copy.deepcopy(cfg['report'])
+        sync_platform_report(started_report,started.get('platform'))
+        check_platform_identity(cfg['report'],started_report,physical=True)
         last_message=None
         previous_poll=None
         displayed_results={}
@@ -4437,9 +4655,9 @@ def demo(cfg):
     hw['mapping_verified']=True
     epoch=datetime(2026,9,23,10,0,tzinfo=BJ).timestamp()
     all_surface=[]
-    for mode in ORDER:
+    for index, mode in enumerate(ORDER):
         item=cfg['tests'][mode]
-        epoch+=item['wait_before_s']
+        epoch+=0 if index == 0 else item['wait_before_s']
         stage=manual/'主机数据'/mode; stage.mkdir(parents=True)
         smart=[]
         for second in range(0,item['duration_s'],item['interval_s']):
@@ -4457,6 +4675,7 @@ def demo(cfg):
                                 'source_row':len(all_surface)+1,'CPU_Surface':value,'NAND_Surface':value-5,'AMB':24})
         save_json(stage/'conditions.json',{'mode':mode,'start_epoch':epoch,'end_epoch':epoch+item['duration_s'],
             'interval_s':item['interval_s'],'points':item['points'],'hwinfo':hw,'simulated':True,
+            **{key:item[key] for key in ('plot_interval_s','window_s') if key in item},
             'workload_status':'模拟数据，未运行真实负载'})
         epoch+=item['duration_s']
     with (manual/'jk808.jsonl').open('w',encoding='utf-8') as stream:
@@ -4545,7 +4764,7 @@ def main():
         if role=='host':
             run_host(cfg); return
         while True:
-            print('\nJK808 Windows '+VERSION+'\nA. 首次部署 / 检查\nB. 执行测试\nD. 继续上次未完成测试\n0. 退出')
+            print('\nJK808 Windows '+VERSION+'\nA. 首次部署 / 检查\nB. 执行测试\nD. 继续上次未完成测试\nE. 生成/更新本批次统一结果\n0. 退出')
             choice=input('请选择：').strip().upper()
             if choice=='0': return
             try:
@@ -4561,6 +4780,9 @@ def main():
                     if modes: run_receiver(cfg,modes)
                 elif choice=='D':
                     resume_failed_flow(cfg,input('原结果文件夹路径（回车使用最近正式任务）：').strip().strip('"'))
+                elif choice=='E':
+                    path=input('项目/批次结果目录（回车使用当前配置目录）：').strip().strip('"')
+                    rebuild_selected_batch(cfg,path or None)
             except Exception as exc:
                 print('本次操作未完成：'+str(exc))
 
